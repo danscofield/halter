@@ -20,8 +20,8 @@ Properties from the design.
 
 ## Tasks
 
-- [ ] 1. Scaffold the `halter-goals` crate and shared type foundations
-  - [ ] 1.1 Create the crate and wire it into the workspace
+- [x] 1. Scaffold the `halter-goals` crate and shared type foundations
+  - [x] 1.1 Create the crate and wire it into the workspace
     - Add `crates/halter-goals` with `Cargo.toml` depending on `halter-protocol`,
       `halter-session`, `halter-hooks`, `serde`, `sha2`, `tokio`, `async-trait`, and
       `proptest` (dev-dependency)
@@ -29,7 +29,7 @@ Properties from the design.
     - Create `src/lib.rs` exposing empty `goal_model`, `tier1`, and `tier2` modules
     - _Requirements: 1.6_
 
-  - [ ] 1.2 Define shared identifier and value types
+  - [x] 1.2 Define shared identifier and value types
     - Define `GoalNodeId`, `SubtreeHash`, `MemoryId`, `IntentType`, `TargetType`,
       `TargetRef`, `Scope`, `ToolName`, `CanonicalJson`, `EvidenceValue`, `Timestamp`,
       `Duration`, `EventKey`, `EventSeq`, and `Sha256` newtypes with `serde` derives
@@ -37,14 +37,14 @@ Properties from the design.
       and `scope`
     - _Requirements: 7.1, 8.1_
 
-  - [ ] 1.3 Define the `ValidityToken`, `SourceDescriptor`, and `ToolCall` types
+  - [x] 1.3 Define the `ValidityToken`, `SourceDescriptor`, and `ToolCall` types
     - Define `ValidityToken` enum (`ContentHash`, `Ttl`, `EventDriven`) and
       `SourceDescriptor` enum (`Pinnable`, `Volatile`, `Signalled`)
     - Define `ToolCall` with `tool`, `normalized_args`, `validity_token`, and `outcome`
     - _Requirements: 9.4, 8.1_
 
-- [ ] 2. Implement Tier 1 argument normalization
-  - [ ] 2.1 Implement `normalize_args`
+- [x] 2. Implement Tier 1 argument normalization
+  - [x] 2.1 Implement `normalize_args`
     - Write the pure, total canonicalization function producing byte-stable `CanonicalJson`
       (sorted object keys, whitespace stripped, scalar encodings folded, defaults explicit)
     - Return a canonicalization error for arguments that cannot be canonicalized for the tool
@@ -58,14 +58,14 @@ Properties from the design.
     - Test non-canonicalizable arguments return an error and touch no cache entry
     - _Requirements: 8.6_
 
-- [ ] 3. Implement the Tier 1 Validity Token Service
-  - [ ] 3.1 Implement `issue_token`
+- [x] 3. Implement the Tier 1 Validity Token Service
+  - [x] 3.1 Implement `issue_token`
     - Mint `ContentHash` (SHA-256 of readable content), `Ttl` (`issued_at`/`ttl`), and
       `EventDriven` (current `EventSeq` on subscription) per source volatility class
     - Reject `Pinnable` sources whose content is unreadable at issuance
     - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6_
 
-  - [ ] 3.2 Implement `holds` re-validation
+  - [x] 3.2 Implement `holds` re-validation
     - Implement per-variant checks: `ContentHash` iff current content hashes to `h`; `Ttl`
       iff `now() < issued_at + ttl`; `EventDriven` iff no event newer than `last_seen`
     - Treat an unreachable source as not held (fail-safe); never mutate token/source/evidence
@@ -88,24 +88,24 @@ Properties from the design.
       returns false on unreachable sources
     - _Requirements: 9.5, 9.6, 10.5_
 
-- [ ] 4. Implement the Tier 1 evidence cache
-  - [ ] 4.1 Define `CacheEntry`, `CacheLookup`, `Freshness` and the `Tier1Cache` trait
+- [x] 4. Implement the Tier 1 evidence cache
+  - [x] 4.1 Define `CacheEntry`, `CacheLookup`, `Freshness` and the `Tier1Cache` trait
     - Define `CacheEntry` (tool, normalized_args, validity_token, evidence_value, stored_at),
       `CacheLookup` (`Hit`/`Stale`/`Miss`), and `Freshness` (`Fresh`/`Stale`)
     - Declare the `Tier1Cache` trait with `get`, `put`, `issue_token`, and `revalidate`
     - _Requirements: 11.1, 12.1, 13.1_
 
-  - [ ] 4.2 Implement the cache read path (`get`)
+  - [x] 4.2 Implement the cache read path (`get`)
     - Locate the entry by `tool + normalized_args`, call `holds`, and return
       `Hit`/`Stale`/`Miss`; treat unreachable source as `Stale`; never mutate stored evidence
     - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5_
 
-  - [ ] 4.3 Implement the cache write path (`put`)
+  - [x] 4.3 Implement the cache write path (`put`)
     - Store evidence under a token that holds, replacing any prior entry for the key (exactly
       one entry per key); reject writes whose token does not hold at write time
     - _Requirements: 12.1, 12.2, 12.3_
 
-  - [ ] 4.4 Implement `revalidate`
+  - [x] 4.4 Implement `revalidate`
     - Return `Fresh`/`Stale` for a recorded token without returning or mutating evidence;
       treat unreachable source as `Stale`; keep concrete evidence values owned by Tier 1
     - _Requirements: 13.1, 13.2, 13.3_
@@ -123,18 +123,18 @@ Properties from the design.
       freshness without value return
     - _Requirements: 11.3, 12.3, 13.1_
 
-- [ ] 5. Checkpoint - Tier 1 complete
+- [x] 5. Checkpoint - Tier 1 complete
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 6. Implement the Goal Model data model and fold
-  - [ ] 6.1 Define `GoalNode`, `Resolution`, `GoalTree`, and `GoalEvent`
+- [x] 6. Implement the Goal Model data model and fold
+  - [x] 6.1 Define `GoalNode`, `Resolution`, `GoalTree`, and `GoalEvent`
     - Define `GoalNode` (id, parent, children, hypothesis, resolution_conditions, resolution,
       intent, tool_calls, subtree_hash), `Resolution` enum, `GoalTree`/`GoalTreeState`, and
       the `GoalEvent` variants (`GoalNodeCreated`, `GoalNodeRevised`, `GoalNodeResolved`,
       `GoalClosed`) with `GoalNodeRevision`
     - _Requirements: 1.2, 2.1, 4.1_
 
-  - [ ] 6.2 Implement the goal fold
+  - [x] 6.2 Implement the goal fold
     - Implement `apply_event`-style folding: `GoalNodeCreated` inserts an `Open` node and adds
       it to its parent's children; `GoalNodeRevised` layers a delta; `GoalNodeResolved` sets
       resolution and re-opens affected descendants; `GoalClosed` marks the closure boundary
@@ -145,7 +145,7 @@ Properties from the design.
     - **Property 4: Goal tree fold/replay determinism**
     - **Validates: Requirements 3.1, 3.2**
 
-  - [ ] 6.4 Implement `subtree_hash`
+  - [x] 6.4 Implement `subtree_hash`
     - Compute a deterministic, order-insensitive hash over a resolved node's intent-relevant
       fields (hypothesis, resolution_conditions, resolution, intent, canonical tool_calls)
       combined with each resolved child's `subtree_hash` in canonical child order
@@ -155,8 +155,8 @@ Properties from the design.
     - **Property 1: `subtree_hash` determinism over a resolved subtree**
     - **Validates: Requirements 5.1, 5.2, 5.3, 5.4, 5.5**
 
-- [ ] 7. Implement `IntentSignature` derivation
-  - [ ] 7.1 Implement intent signature derivation and attachment
+- [x] 7. Implement `IntentSignature` derivation
+  - [x] 7.1 Implement intent signature derivation and attachment
     - Derive all four fields (`intent_type`, `target_type`, `target_ref`, `scope`) on create
       and revise; reject the operation and identify unresolved fields when any cannot resolve
     - Expose each existing node's attached `IntentSignature` for Tier 2 retrieval/merge
@@ -166,20 +166,20 @@ Properties from the design.
     - Test all-fields-populated success and per-field rejection with prior state retained
     - _Requirements: 7.1, 7.2_
 
-- [ ] 8. Implement the `GoalStore` over the session store
-  - [ ] 8.1 Define the `GoalStore` trait and `ClosureOutcome`, and wire session-store commit
+- [x] 8. Implement the `GoalStore` over the session store
+  - [x] 8.1 Define the `GoalStore` trait and `ClosureOutcome`, and wire session-store commit
     - Declare `GoalStore` (`create`, `revise`, `close`, `get`, `get_tree`) and
       `ClosureOutcome { closed, subtree_hash }`
     - Implement the append path that commits `GoalEvent`s through `SessionStore::commit` with
       `expected_head_sequence`, sharing one gap-free monotonic sequence-ordered log
     - _Requirements: 1.1, 3.3, 3.4_
 
-  - [ ] 8.2 Implement `create`
+  - [x] 8.2 Implement `create`
     - Append exactly one `GoalNodeCreated`, return a unique node id; reject non-existent
       parent and empty hypothesis, appending no event and leaving log/tree unchanged
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6_
 
-  - [ ] 8.3 Implement `revise`
+  - [x] 8.3 Implement `revise`
     - Append exactly one `GoalNodeRevised` without mutating prior events; re-open affected
       subtrees; reject non-existent node with no event appended
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6_
@@ -188,13 +188,13 @@ Properties from the design.
     - **Property 3: Retroactive revision preserves append-only event-log semantics**
     - **Validates: Requirements 2.1, 2.2, 2.3**
 
-  - [ ] 8.5 Implement `close` and closure detection
+  - [x] 8.5 Implement `close` and closure detection
     - Append `GoalNodeResolved`; detect full subtree closure; append exactly one `GoalClosed`
       carrying the computed `subtree_hash` per distinct `(node_id, subtree_hash)`; return the
       correct `ClosureOutcome`; reject `Open` resolution and non-existent nodes
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6_
 
-  - [ ] 8.6 Implement `get` and `get_tree` projection
+  - [x] 8.6 Implement `get` and `get_tree` projection
     - Project a single node or the whole tree by folding replayed `GoalEvent`s
     - _Requirements: 3.1, 3.2_
 
@@ -203,14 +203,14 @@ Properties from the design.
       and `expected_head_sequence` mismatch leaving log/tree unchanged
     - _Requirements: 1.4, 1.5, 2.6, 3.4, 4.4, 4.5_
 
-- [ ] 9. Implement the goal-closure signal and induction enqueue
-  - [ ] 9.1 Dispatch the closure hook through `halter-hooks`
+- [x] 9. Implement the goal-closure signal and induction enqueue
+  - [x] 9.1 Dispatch the closure hook through `halter-hooks`
     - On first append of `GoalClosed` for a `(node_id, subtree_hash)`, dispatch exactly one
       closure signal carrying that key; suppress dispatch for already-recorded keys; treat a
       distinct `subtree_hash` for the same `node_id` as a new trigger
     - _Requirements: 6.1, 6.2, 6.4, 6.5_
 
-  - [ ] 9.2 Enqueue the async induction job from the closure signal
+  - [x] 9.2 Enqueue the async induction job from the closure signal
     - Enqueue exactly one induction job per distinct `(node_id, subtree_hash)` and return
       control to the caller before induction runs (off the hot path)
     - _Requirements: 6.3, 6.4, 14.5_
@@ -219,18 +219,18 @@ Properties from the design.
     - **Property 2: Closure triggers induction exactly once per `(node_id, subtree_hash)`**
     - **Validates: Requirements 6.1, 6.2, 6.3, 6.4, 6.5**
 
-- [ ] 10. Checkpoint - Goal Model complete
+- [x] 10. Checkpoint - Goal Model complete
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 11. Implement the Tier 2 memory model and store
-  - [ ] 11.1 Define the `Memory` model and supporting types
+- [x] 11. Implement the Tier 2 memory model and store
+  - [x] 11.1 Define the `Memory` model and supporting types
     - Define `Memory`, `MemoryKind` (`Fragment`/`Composite`/`Negative`), `ParameterSchema`,
       `Applicability`, `Plan`, `EvidenceContract` (contract items only, no values),
       `OutcomeShape`, `CachedOutcome`, `AnswerMode`, `Provenance`, `Reinforcement`,
       `MemoryVersion`, and `MemoryRecord`
     - _Requirements: 17.1, 17.4_
 
-  - [ ] 11.2 Implement the `MemoryStore` trait with write-time validation
+  - [x] 11.2 Implement the `MemoryStore` trait with write-time validation
     - Implement `insert`, `reinforce`, `filter`, `ann_recall`; validate `kind` presence/range,
       non-empty `evidence_contract` for `Negative`, non-empty `validity_tokens` when
       `cached_outcome` present, `SoundPinnable` requires only `ContentHash` tokens, and store
@@ -246,20 +246,20 @@ Properties from the design.
       empty `validity_tokens` rejection
     - _Requirements: 17.1, 17.3, 17.5, 22.3_
 
-- [ ] 12. Implement the Tier 2 Induction Engine
-  - [ ] 12.1 Implement the recurrence gate
+- [x] 12. Implement the Tier 2 Induction Engine
+  - [x] 12.1 Implement the recurrence gate
     - Record exactly one occurrence per run before evaluating the gate; author nothing and
       skip Judge while `recurrence_count(intent) < N`; proceed to Judge when `>= N`
     - _Requirements: 14.1, 14.2, 14.3, 14.4_
 
-  - [ ] 12.2 Implement two-step Judge-then-Author authoring in a clean context
+  - [x] 12.2 Implement two-step Judge-then-Author authoring in a clean context
     - Invoke Judge and Author as two distinct calls, each in a context free of the original
       goal work's messages/transcript/reasoning; Judge yields verdict+rationale and no memory;
       Author runs only on approve; persist decline rationale; handle author failure by
       inserting nothing, recording the failure, and allowing re-trigger
     - _Requirements: 15.1, 15.2, 15.3, 15.4, 15.5, 15.6_
 
-  - [ ] 12.3 Implement idempotency, dedup, and reinforcement
+  - [x] 12.3 Implement idempotency, dedup, and reinforcement
     - Key on `(node_id, subtree_hash)` for at-most-one memory; reinforce on intent+plan match
       instead of inserting; serialize concurrent inductions on the idempotency key
     - _Requirements: 16.1, 16.2, 16.3_
@@ -277,8 +277,8 @@ Properties from the design.
     - **Property 16: Clean-context authoring**
     - **Validates: Requirements 15.1, 15.5**
 
-- [ ] 13. Implement Tier 2 Retrieval
-  - [ ] 13.1 Implement `retrieve_memories`
+- [x] 13. Implement Tier 2 Retrieval
+  - [x] 13.1 Implement `retrieve_memories`
     - Apply the structured filter over all four `IntentSignature` fields first; invoke
       embedding recall only when the head is below `HEAD_MIN`, bounded by `TAIL_LIMIT`, and
       dedup the union by `MemoryId`; exclude candidates failing applicability; order by cheap
@@ -294,25 +294,25 @@ Properties from the design.
       the structured head without error
     - _Requirements: 18.4, 18.7_
 
-- [ ] 14. Implement the Tier 2 Replay Engine
-  - [ ] 14.1 Implement `decide_replay` fixed decision order
+- [x] 14. Implement the Tier 2 Replay Engine
+  - [x] 14.1 Implement `decide_replay` fixed decision order
     - Evaluate the answer-cache check before the procedure-replay fallback; skip the check
       when no `cached_outcome`; fall through to replay when no servable answer
     - _Requirements: 19.1, 19.2, 19.3_
 
-  - [ ] 14.2 Implement Mode A verified serving
+  - [x] 14.2 Implement Mode A verified serving
     - Return `ServeAnswer { verified = true }` only when a `SoundPinnable` outcome's every
       token holds at serve time; otherwise fall through; never mark verified unless all tokens
       confirmed to hold
     - _Requirements: 20.1, 20.2, 20.3, 20.4_
 
-  - [ ] 14.3 Implement Mode B bounded-volatile serving
+  - [x] 14.3 Implement Mode B bounded-volatile serving
     - Serve a `BoundedVolatile` answer only when the intent type opted in and age `<= max_age`,
       always marked believed-unverified; otherwise fall through; never activate Mode B by
       default
     - _Requirements: 21.1, 21.2, 21.3, 21.4, 21.5_
 
-  - [ ] 14.4 Implement procedure-replay evidence re-validation
+  - [x] 14.4 Implement procedure-replay evidence re-validation
     - Re-validate every `evidence_contract` item through `Tier1Cache::revalidate` before
       trusting the plan; report `evidence_fully_fresh` only when all items are `Fresh`; on
       Tier 1 unavailability treat all evidence as stale, serve no verified answer, and serve a
@@ -335,16 +335,16 @@ Properties from the design.
     - **Property 20: Evidence re-validation on replay**
     - **Validates: Requirements 23.1, 23.2, 23.3**
 
-- [ ] 15. Checkpoint - Tier 2 complete
+- [x] 15. Checkpoint - Tier 2 complete
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 16. Integration and wiring
-  - [ ] 16.1 Wire goal closure to the Tier 2 induction pipeline end to end
+- [x] 16. Integration and wiring
+  - [x] 16.1 Wire goal closure to the Tier 2 induction pipeline end to end
     - Connect the closure hook enqueue to `induce_memory` (gate -> Judge -> Author ->
       dedup/reinforce/insert) running async off the hot path
     - _Requirements: 6.3, 14.5, 15.1, 16.1_
 
-  - [ ] 16.2 Wire retrieval and replay to Tier 1 on the hot path
+  - [x] 16.2 Wire retrieval and replay to Tier 1 on the hot path
     - Connect `retrieve_memories` output into `decide_replay`, calling `Tier1Cache::revalidate`
       for evidence and `holds` for answer tokens; expose the crate's public API from `lib.rs`
     - _Requirements: 13.2, 19.1, 20.1, 23.1_
@@ -358,7 +358,7 @@ Properties from the design.
       re-validates evidence through Tier 1
     - _Requirements: 6.3, 18.1, 23.1_
 
-- [ ] 17. Final checkpoint - Ensure all tests pass
+- [x] 17. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes
