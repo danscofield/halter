@@ -876,10 +876,20 @@ impl SessionHandle {
             return;
         }
 
-        let mut context = attribution
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *context = GoalAttributionContext::auto_rehydrated(store.clone(), stack);
+        let resumed_active = stack.active().cloned();
+        {
+            let mut context = attribution
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *context = GoalAttributionContext::auto_rehydrated(store.clone(), stack);
+        }
+
+        // Rehydrate the goal tool's stack to the same resumed focus so the tool
+        // does not start from an empty stack after resume (which would lose the
+        // active node and default a new subgoal's parent to `None`).
+        if let Some(active) = resumed_active {
+            self.seed_tool_goal_stack(&active).await;
+        }
     }
 
     /// Test-only snapshot of the active goal node the chokepoint would stamp,
@@ -1039,9 +1049,15 @@ impl SessionHandle {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !context.stack.is_initialized() {
                 context.stack = stack;
-                context.active = Some(root);
+                context.active = Some(root.clone());
             }
         }
+
+        // Seed the goal tool's stack with the freshly created root so the tool
+        // and the runtime share one focus from the start; otherwise the tool
+        // would default a new subgoal's parent to `None` and report no active
+        // node despite the runtime having established the root.
+        self.seed_tool_goal_stack(&root).await;
 
         // Creating the root advanced the shared session log; report the new
         // authoritative head so the caller's turn-start commit expects it
@@ -1123,6 +1139,71 @@ impl SessionHandle {
                 None
             }
         }
+    }
+
+    /// Adopt the goal tool's active node as the runtime's attribution focus.
+    ///
+    /// The goal tool mutates its own per-session [`GoalStack`] (in
+    /// `tool_sessions`) on `create`/`focus`/`resolve`, but the chokepoint stamps
+    /// the runtime's [`GoalAttributionContext`]. Without this bridge the two
+    /// desync: after the tool changes focus the runtime keeps attributing events
+    /// to the previously active node. Called after each goal-tool execution so
+    /// subsequent turn events attribute to the node the agent just made active.
+    ///
+    /// A no-op when goal tracking is off (no attribution context) or when the
+    /// tool stack has no active node yet (nothing to adopt); it never clears an
+    /// existing focus to `None`, so a tool call that leaves the stack untouched
+    /// keeps the current attribution.
+    fn sync_goal_focus_from_tool_stack(&self) {
+        let Some(attribution) = &self.goal_attribution else {
+            return;
+        };
+        let tool_active = self
+            .services
+            .tool_sessions
+            .goal_session(&self.session_id)
+            .lock()
+            .active()
+            .cloned();
+        let Some(active) = tool_active else {
+            return;
+        };
+        let mut context = attribution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if context.is_auto() {
+            context.set_active(Some(active));
+        }
+    }
+
+    /// Seed the goal tool's per-session [`GoalStack`] with the root→active path
+    /// ending at `active`, folded from the shared goal tree.
+    ///
+    /// Keeps the tool's stack consistent with the runtime's attribution focus
+    /// when the runtime establishes it without the tool — lazy root creation and
+    /// resume rehydration. Without this the tool would start from an empty stack
+    /// (defaulting a new subgoal's parent to `None` and reporting no active
+    /// node) even though the runtime already has a focus. A no-op when the tree
+    /// does not contain `active`.
+    async fn seed_tool_goal_stack(&self, active: &GoalNodeId) {
+        let Some(store) = self.services.goal_store.as_ref() else {
+            return;
+        };
+        let tree = match store.get_tree(&self.session_id).await {
+            Ok(tree) => tree,
+            Err(error) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %error,
+                    "failed to fold goal tree while seeding the tool goal stack; leaving it empty"
+                );
+                return;
+            }
+        };
+        let stack = self.services.tool_sessions.goal_session(&self.session_id);
+        // `focus` rebuilds the stack as the root→active path; it is a no-op that
+        // leaves the stack unchanged when `active` is absent from the tree.
+        let _ = stack.lock().focus(active, &tree);
     }
 
     pub(crate) fn session_hooks(&self) -> &Arc<Hooks> {
@@ -2186,6 +2267,12 @@ impl SessionHandle {
                     tool_event_drain,
                 } = prep;
                 drop(context);
+                // The goal tool mutates its own per-session stack; adopt its
+                // active node as the runtime's attribution focus so this tool
+                // call's completion events and every later turn event attribute
+                // to the node the agent just made active (rather than the stale
+                // previous focus). A no-op for non-goal tools and in off mode.
+                self.sync_goal_focus_from_tool_stack();
                 for payload in tool_event_drain
                     .into_events()
                     .into_iter()
@@ -4953,6 +5040,164 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    /// Regression: the goal tool mutates its own per-session stack, but the
+    /// runtime chokepoint stamps the runtime's attribution context. Without a
+    /// bridge the two desync — after the tool changes focus the runtime keeps
+    /// attributing events to the old node. `sync_goal_focus_from_tool_stack`
+    /// (called after each tool execution in the turn loop) must adopt the tool's
+    /// active node so subsequent events attribute to it.
+    #[tokio::test]
+    async fn goal_tool_focus_change_syncs_runtime_attribution() {
+        use halter_goals::{EventLogGoalStore, SessionStoreGoalEventLog};
+        use halter_tools::{GoalTool, Tool as _, ToolContext};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let goal_store: Arc<dyn halter_goals::GoalStore> = Arc::new(EventLogGoalStore::new(
+            SessionStoreGoalEventLog::new(services.sessions.clone()),
+        ));
+        {
+            let services = Arc::get_mut(&mut services).expect("unique services");
+            services.goal_tracking = GoalAttributionMode::Auto;
+            services.goal_store = Some(goal_store.clone());
+        }
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let session_id = session.session_id().clone();
+
+        // Establish the root through the runtime (as the turn loop does).
+        let mut start_events = Vec::new();
+        session.ensure_goal_root(&mut start_events).await;
+        let root = session.goal_active_node().expect("root established");
+
+        // The tool creates a subgoal, making it active on the tool's stack.
+        let tool = GoalTool::new(goal_store.clone());
+        let context = ToolContext {
+            session_id: session_id.clone(),
+            working_dir: temp.path().to_path_buf(),
+            path_locks: services.path_locks.clone(),
+            tool_sessions: services.tool_sessions.clone(),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(halter_tools::NoopToolEventSink),
+            policy: services.policy.clone(),
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        };
+        let created = tool
+            .execute(
+                context,
+                serde_json::json!({ "action": "create", "hypothesis": "check the parser" }),
+            )
+            .await
+            .expect("create subgoal");
+        let subgoal = match created {
+            ToolResult::Json { value } => GoalNodeId::from(
+                value["id"].as_str().expect("subgoal id").to_owned(),
+            ),
+            other => panic!("unexpected tool result: {other:?}"),
+        };
+        assert_ne!(subgoal, root, "the subgoal is a new node");
+
+        // Before syncing, the runtime still attributes to the root (the bug).
+        assert_eq!(session.goal_active_node(), Some(root.clone()));
+
+        // The turn loop calls this after each tool execution.
+        session.sync_goal_focus_from_tool_stack();
+
+        // Now the runtime attributes to the subgoal the tool made active, and
+        // the chokepoint stamps it onto turn events.
+        assert_eq!(session.goal_active_node(), Some(subgoal.clone()));
+        let tagged = session.make_event(SessionEventPayload::TurnCompleted {
+            turn_id: TurnId::from("turn-after-focus"),
+            usage: Usage::default(),
+            goal_node: None,
+        });
+        match tagged.payload {
+            SessionEventPayload::TurnCompleted { goal_node, .. } => {
+                assert_eq!(goal_node, Some(subgoal));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// Regression: on resume the runtime rehydrates its own attribution stack,
+    /// but the goal tool's per-session stack must be rehydrated to the same
+    /// focus too — otherwise the tool starts empty (losing the active node and
+    /// defaulting a new subgoal's parent to `None`).
+    #[tokio::test]
+    async fn resume_rehydrates_goal_tool_stack_to_the_active_node() {
+        use halter_goals::{EventLogGoalStore, IntentSignature, SessionStoreGoalEventLog};
+
+        fn goal_intent() -> IntentSignature {
+            IntentSignature {
+                intent_type: "session".into(),
+                target_type: "session".into(),
+                target_ref: "root".into(),
+                scope: "session".into(),
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let goal_store: Arc<dyn halter_goals::GoalStore> = Arc::new(EventLogGoalStore::new(
+            SessionStoreGoalEventLog::new(services.sessions.clone()),
+        ));
+        {
+            let services = Arc::get_mut(&mut services).expect("unique services");
+            services.goal_tracking = GoalAttributionMode::Auto;
+            services.goal_store = Some(goal_store.clone());
+        }
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let session_id = session.session_id().clone();
+
+        // Persist a root and a subgoal.
+        let root = goal_store
+            .create(&session_id, None, "session root".to_owned(), goal_intent())
+            .await
+            .expect("create root");
+        let subgoal = goal_store
+            .create(
+                &session_id,
+                Some(root.clone()),
+                "investigate".to_owned(),
+                goal_intent(),
+            )
+            .await
+            .expect("create subgoal");
+
+        // Resume the session.
+        let resumed = runtime
+            .resume(&session_id)
+            .await
+            .expect("resume")
+            .expect("session exists");
+
+        // The runtime's attribution resumes (root-fallback reconstruction).
+        let resumed_active = resumed.goal_active_node().expect("resumed active");
+
+        // The goal tool's stack must be rehydrated to the same active node,
+        // rather than starting empty and losing focus.
+        let tool_active = services
+            .tool_sessions
+            .goal_session(&session_id)
+            .lock()
+            .active()
+            .cloned();
+        assert_eq!(
+            tool_active,
+            Some(resumed_active),
+            "the goal tool stack must resume at the same focus as the runtime"
+        );
+        // The rehydrated focus is a node from the persisted tree, not an empty
+        // or fresh stack.
+        assert!(
+            tool_active == Some(root) || tool_active == Some(subgoal),
+            "resumed tool focus must be a persisted node"
+        );
     }
 
     /// Regression: lazily creating the root goal on the first turn advances the
