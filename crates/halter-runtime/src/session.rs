@@ -982,27 +982,51 @@ impl SessionHandle {
     /// a `Warning` is emitted, and the turn is neither blocked nor failed
     /// (Requirement 10.2). See [`ensure_goal_root`](Self::ensure_goal_root) for
     /// the wrapper the turn loop uses that performs that degradation.
-    async fn ensure_goal_root_inner(&self) -> Result<(), GoalStoreError> {
-        // Snapshot the pieces we need under the lock, then release it before the
-        // async store call (the `Mutex` is a std sync mutex, not held across
-        // `.await`).
-        let (mut stack, store) = {
+    /// Returns `Ok(Some(head))` with the shared session log's authoritative
+    /// head sequence after ensuring the root, so the caller can commit its turn
+    /// events against the current head rather than a value captured before this
+    /// call. Creating the root appends a `GoalNodeCreated` event through the
+    /// *same* `SessionStore`, advancing the shared head; a caller that reused a
+    /// head captured earlier would commit against a stale expectation and lose
+    /// the OCC race. Returns `Ok(None)` when goal tracking is off or no store is
+    /// wired — nothing was written, so the caller's cached head is still valid.
+    async fn ensure_goal_root_inner(&self) -> Result<Option<u64>, GoalStoreError> {
+        // Snapshot the pieces we need under the lock, then release it before any
+        // async call (the `Mutex` is a std sync mutex and must not be held
+        // across `.await`, both for correctness and to keep the future `Send`).
+        // The block resolves to the stack + store to create the root with, or
+        // `None` when the root already exists (no write) — every `.await`
+        // happens after the guard is out of scope.
+        let to_create = {
             let Some(attribution) = &self.goal_attribution else {
-                return Ok(());
+                return Ok(None);
             };
             let context = attribution
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !context.is_auto() || context.stack.is_initialized() {
-                // Off, or the root already exists — nothing to do.
-                return Ok(());
+            if !context.is_auto() {
+                // Off — nothing to do and no store to consult.
+                return Ok(None);
             }
             let Some(store) = context.store.clone() else {
                 // No store wired (e.g. task-6.1-era test context): degrade to a
                 // no-op rather than fail.
-                return Ok(());
+                return Ok(None);
             };
-            (context.stack.clone(), store)
+            if context.stack.is_initialized() {
+                // The root already exists, so `ensure_root` would not write.
+                None
+            } else {
+                Some((context.stack.clone(), store))
+            }
+        };
+
+        let Some((mut stack, store)) = to_create else {
+            // The root already exists, so nothing was appended here; but an
+            // earlier turn or a concurrent writer may have advanced the shared
+            // log, so report the authoritative head so the caller commits
+            // against the current value rather than a stale capture.
+            return self.shared_head_sequence().await;
         };
 
         let root = stack.ensure_root(store.as_ref(), &self.session_id).await?;
@@ -1018,7 +1042,42 @@ impl SessionHandle {
                 context.active = Some(root);
             }
         }
-        Ok(())
+
+        // Creating the root advanced the shared session log; report the new
+        // authoritative head so the caller's turn-start commit expects it
+        // rather than the head captured before this call.
+        self.shared_head_sequence().await
+    }
+
+    /// The shared session log's current head sequence, read from the
+    /// authoritative [`SessionStore`] the turn-start commit targets.
+    ///
+    /// Returns `Ok(Some(head))` when a session record exists. Goal events and
+    /// transcript events share one monotonic sequence on that one log, so this
+    /// is the head a turn-start commit must expect after
+    /// [`ensure_goal_root_inner`](Self::ensure_goal_root_inner) may have
+    /// appended a `GoalNodeCreated`. Reading it from `services.sessions` — the
+    /// same store the commit targets — is correct regardless of where the goal
+    /// store wrote: in production they are the one shared log, and a goal store
+    /// backed by an independent log (test wiring) leaves this head unchanged and
+    /// still valid for the commit.
+    ///
+    /// Returns `Ok(None)` when no session record exists yet (e.g. a bare
+    /// in-memory test harness), so the caller keeps its cached head rather than
+    /// treating a missing record as a failure and emitting a spurious warning.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces a load failure as a [`GoalStoreError::Log`] so the caller
+    /// degrades attribution gracefully rather than failing the turn.
+    async fn shared_head_sequence(&self) -> Result<Option<u64>, GoalStoreError> {
+        Ok(self
+            .services
+            .sessions
+            .load_session(&self.session_id)
+            .await
+            .map_err(|error| GoalStoreError::Log(error.to_string()))?
+            .map(|stored| stored.head_sequence))
     }
 
     /// Ensure the root goal exists at an async point, degrading gracefully on
@@ -1030,25 +1089,39 @@ impl SessionHandle {
     /// attribution simply stays `goal_node = None` for the session's events
     /// until a later attempt succeeds. In `off` mode it is a no-op.
     ///
+    /// Returns the shared session log's authoritative head sequence when goal
+    /// tracking is on and a store is wired, so the caller commits its turn
+    /// events against the head *after* any `GoalNodeCreated` this appended
+    /// rather than a value captured before this call. Returns `None` when
+    /// tracking is off, no store is wired, or root creation failed — in every
+    /// such case nothing was written, so the caller's cached head is still
+    /// valid.
+    ///
     /// [`ensure_goal_root_inner`]: Self::ensure_goal_root_inner
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn ensure_goal_root(&self, events: &mut Vec<PendingEvent>) {
-        if let Err(error) = self.ensure_goal_root_inner().await {
-            warn!(
-                session_id = %self.session_id,
-                error = %error,
-                "failed to create root goal; degrading attribution to goal_node = None"
-            );
-            // Emit a Warning but never block or fail the turn (Requirement 10.2).
-            self.push_event(
-                events,
-                SessionEventPayload::Warning {
-                    message: format!(
-                        "goal tracking: failed to create the root goal; continuing without goal attribution for this turn: {error}"
-                    ),
-                    goal_node: None,
-                },
-            );
+    async fn ensure_goal_root(&self, events: &mut Vec<PendingEvent>) -> Option<u64> {
+        match self.ensure_goal_root_inner().await {
+            Ok(head) => head,
+            Err(error) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %error,
+                    "failed to create root goal; degrading attribution to goal_node = None"
+                );
+                // Emit a Warning but never block or fail the turn (Requirement
+                // 10.2). No goal event was committed, so the shared head did not
+                // advance and the caller's cached head stays valid.
+                self.push_event(
+                    events,
+                    SessionEventPayload::Warning {
+                        message: format!(
+                            "goal tracking: failed to create the root goal; continuing without goal attribution for this turn: {error}"
+                        ),
+                        goal_node: None,
+                    },
+                );
+                None
+            }
         }
     }
 
@@ -1143,12 +1216,20 @@ impl SessionHandle {
             // sync chokepoint can attribute the turn's events to it (Requirement
             // 4.1). On failure this pushes a `Warning` and never blocks the turn
             // (Requirement 10.2); in `off` mode it is a no-op.
-            session.ensure_goal_root(&mut start_events).await;
+            // Creating the root appends a `GoalNodeCreated` through the shared
+            // session log, advancing its head past the value captured at load.
+            // Commit the turn-start events against the head reported back rather
+            // than the stale `stored.head_sequence`, or the OCC check rejects
+            // the commit as a conflict.
+            let expected_head = session
+                .ensure_goal_root(&mut start_events)
+                .await
+                .unwrap_or(stored.head_sequence);
             let start_head = match session
                 .commit_and_publish(
                     &blueprint,
                     None,
-                    Some(stored.head_sequence),
+                    Some(expected_head),
                     None,
                     start_events,
                     Some(live.as_ref()),
@@ -1157,7 +1238,7 @@ impl SessionHandle {
             {
                 Ok(committed) => committed
                     .last()
-                    .map_or(stored.head_sequence, SessionEvent::sequence),
+                    .map_or(expected_head, SessionEvent::sequence),
                 Err(error) => {
                     error!(
                         session_id = %session.session_id,
@@ -4872,6 +4953,84 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    /// Regression: lazily creating the root goal on the first turn advances the
+    /// shared session log, so the turn-start commit must expect the *new* head
+    /// rather than the head captured at load. Before the fix the commit reused
+    /// the pre-root head and lost the OCC race (`SessionCommitConflict`); the
+    /// turn must now complete cleanly and the log stay gap-free with the root
+    /// `GoalNodeCreated` committed before the turn's own events.
+    #[tokio::test]
+    async fn first_turn_lazy_root_creation_does_not_collide_with_turn_start_commit() {
+        use halter_goals::{EventLogGoalStore, GoalEvent, SessionStoreGoalEventLog};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        // Auto tracking with a goal store sharing the SAME session store: goal
+        // events and turn events land on one log with one monotonic sequence.
+        let goal_store: Arc<dyn halter_goals::GoalStore> = Arc::new(EventLogGoalStore::new(
+            SessionStoreGoalEventLog::new(services.sessions.clone()),
+        ));
+        {
+            let services = Arc::get_mut(&mut services).expect("unique services");
+            services.goal_tracking = GoalAttributionMode::Auto;
+            services.goal_store = Some(goal_store.clone());
+        }
+
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let session_id = session.session_id().clone();
+
+        // The first turn triggers lazy root creation before the turn-start
+        // commit. This must succeed rather than fail with a sequence conflict.
+        session
+            .submit_turn(Turn::user("hello"))
+            .await
+            .expect("submit first turn without a sequence conflict")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        // The root goal was committed exactly once, on the shared log.
+        let tree = goal_store.get_tree(&session_id).await.expect("tree");
+        assert_eq!(tree.len(), 1, "exactly the lazily-created root");
+
+        // The shared log is gap-free and monotonic, and the root
+        // GoalNodeCreated precedes the turn's own events.
+        let events = services
+            .sessions
+            .replay(&session_id)
+            .await
+            .expect("replay");
+        for (offset, event) in events.iter().enumerate() {
+            assert_eq!(
+                event.sequence(),
+                offset as u64 + 1,
+                "sequences are gap-free and monotonic from 1"
+            );
+        }
+        let root_seq = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.payload,
+                    SessionEventPayload::Goal {
+                        event: GoalEvent::GoalNodeCreated { .. }
+                    }
+                )
+            })
+            .map(SessionEvent::sequence)
+            .expect("root GoalNodeCreated is on the log");
+        let turn_started_seq = events
+            .iter()
+            .find(|event| matches!(&event.payload, SessionEventPayload::TurnStarted { .. }))
+            .map(SessionEvent::sequence)
+            .expect("TurnStarted is on the log");
+        assert!(
+            root_seq < turn_started_seq,
+            "the root goal is committed before the turn's own events (root {root_seq} < turn start {turn_started_seq})"
+        );
     }
 
     /// The log/checkpoint invariant end-to-end: after real turns through the
