@@ -9,6 +9,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 #[cfg(feature = "browser-tools")]
 use crate::builtin::browser::session::BrowserSession;
+use crate::builtin::goal::GoalStack;
 #[cfg(feature = "pty")]
 use crate::builtin::pty::PtySessionHandle;
 use crate::builtin::shell::session::ShellSessionCore;
@@ -19,6 +20,7 @@ use crate::builtin::task::TaskList;
 pub struct ToolSessionStore {
     shell_sessions: DashMap<String, Arc<TokioMutex<Option<ShellSessionCore>>>>,
     task_sessions: DashMap<String, Arc<Mutex<TaskList>>>,
+    goal_sessions: DashMap<String, Arc<Mutex<GoalStack>>>,
     #[cfg(feature = "pty")]
     pty_sessions: DashMap<String, Arc<Mutex<Option<PtySessionHandle>>>>,
     #[cfg(feature = "browser-tools")]
@@ -47,6 +49,18 @@ impl ToolSessionStore {
         self.task_sessions
             .entry(session_id.0.clone())
             .or_insert_with(|| Arc::new(Mutex::new(TaskList::default())))
+            .clone()
+    }
+
+    /// Returns the per-session active-goal stack bound to this session, creating
+    /// it on first access. Mirrors `task_session`: storage is process-local, and
+    /// a rehydrating backend (folding the session's goal events into the stack on
+    /// resume, task 9.2) can seed it without touching `GoalTool`.
+    #[must_use]
+    pub fn goal_session(&self, session_id: &SessionId) -> Arc<Mutex<GoalStack>> {
+        self.goal_sessions
+            .entry(session_id.0.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(GoalStack::default())))
             .clone()
     }
 

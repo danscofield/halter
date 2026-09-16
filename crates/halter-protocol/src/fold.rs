@@ -45,9 +45,27 @@ use crate::{Message, SessionEvent, SessionEventPayload, SessionState};
 /// fold-covered fields (see the module docs for the exact list). Events that
 /// carry no state transition — lifecycle markers, hook run summaries, deltas,
 /// tool output chunks — are no-ops.
+///
+/// # Goal attribution is invisible to the transcript fold
+///
+/// Turn-attributable payloads carry an optional `goal_node` attribution tag
+/// (see [`SessionEventPayload`]), and the [`SessionEventPayload::Goal`] payload
+/// carries a goal-tree mutation. Neither participates in this fold:
+///
+/// - [`SessionEventPayload::MessageItem`] is folded **reading only `message`**;
+///   its `goal_node` tag is ignored (`..` below). A tagged `MessageItem` folds
+///   to byte-identical `SessionState.messages` content as the same item without
+///   the tag, so attribution never perturbs the transcript window and legacy
+///   logs replay unchanged.
+/// - [`SessionEventPayload::Goal`] is a **no-op for `SessionState.messages`**;
+///   goal-tree mutations are consumed by the goal fold in `halter-goals`, not
+///   here.
 pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
     match payload {
-        SessionEventPayload::MessageItem { message } => {
+        // Fold reads `message` only; the `goal_node` attribution tag (`..`) is
+        // intentionally ignored so a tagged item yields identical
+        // `SessionState.messages` content to an untagged one.
+        SessionEventPayload::MessageItem { message, .. } => {
             if let Message::Assistant(assistant) = message
                 && let Some(usage) = &assistant.usage
             {
@@ -55,7 +73,7 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             }
             state.append(message.clone());
         }
-        SessionEventPayload::ContextProjectionUpdated { request_tokens } => {
+        SessionEventPayload::ContextProjectionUpdated { request_tokens, .. } => {
             let compacted_prefix = &state.compacted_prefix;
             let messages = &state.messages;
             state
@@ -106,6 +124,11 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         | SessionEventPayload::TurnCompleted { .. }
         | SessionEventPayload::TurnFailed { .. }
         | SessionEventPayload::Lagged { .. }
+        // `Goal` carries a goal-tree mutation consumed by the goal fold in
+        // `halter-goals`; here it is a deliberate no-op that leaves
+        // `SessionState.messages` (and every other fold-covered field)
+        // unchanged.
+        | SessionEventPayload::Goal { .. }
         | SessionEventPayload::SessionShutdownComplete => {}
     }
 }
@@ -179,12 +202,14 @@ mod tests {
             &mut state,
             &SessionEventPayload::MessageItem {
                 message: Message::User(UserMessage::text("hi")),
+                goal_node: None,
             },
         );
         apply_event(
             &mut state,
             &SessionEventPayload::MessageItem {
                 message: assistant_message("hello", Some(usage(10, 5))),
+                goal_node: None,
             },
         );
 
@@ -209,6 +234,7 @@ mod tests {
             &mut state,
             &SessionEventPayload::MessageItem {
                 message: assistant_message("hello", None),
+                goal_node: None,
             },
         );
 
@@ -231,6 +257,7 @@ mod tests {
             &mut state,
             &SessionEventPayload::MessageItem {
                 message: assistant_message("hello", Some(usage(10, 3))),
+                goal_node: None,
             },
         );
 
@@ -293,12 +320,14 @@ mod tests {
             &mut state,
             &SessionEventPayload::MessageItem {
                 message: Message::User(UserMessage::text("compaction nudge")),
+                goal_node: None,
             },
         );
         apply_event(
             &mut state,
             &SessionEventPayload::MessageItem {
                 message: assistant_message("reply", Some(usage(10, 5))),
+                goal_node: None,
             },
         );
         assert_ne!(state.messages, before.messages);
@@ -341,6 +370,59 @@ mod tests {
     }
 
     #[test]
+    fn message_item_folds_identically_with_and_without_goal_tag() {
+        // Task 1.3: the fold reads only `message` and ignores `goal_node`, so a
+        // tagged MessageItem must produce identical SessionState.messages
+        // content to an untagged one.
+        let message = assistant_message("hello", Some(usage(10, 5)));
+
+        let mut untagged = SessionState::default();
+        apply_event(
+            &mut untagged,
+            &SessionEventPayload::MessageItem {
+                message: message.clone(),
+                goal_node: None,
+            },
+        );
+
+        let mut tagged = SessionState::default();
+        apply_event(
+            &mut tagged,
+            &SessionEventPayload::MessageItem {
+                message,
+                goal_node: Some(crate::GoalNodeId::from("some-node")),
+            },
+        );
+
+        assert_eq!(tagged.messages, untagged.messages);
+        assert!(covered_state_matches(&tagged, &untagged));
+    }
+
+    #[test]
+    fn goal_payload_is_a_noop_for_session_state() {
+        // Task 1.3: SessionEventPayload::Goal is a no-op for the transcript
+        // fold; the goal-tree mutation is consumed by the goal fold in
+        // halter-goals, not here.
+        let original = SessionState {
+            messages: vec![Message::User(UserMessage::text("kept"))],
+            usage_so_far: usage(3, 4),
+            ..SessionState::default()
+        };
+        let mut state = original.clone();
+        apply_event(
+            &mut state,
+            &SessionEventPayload::Goal {
+                event: crate::GoalEvent::GoalNodeResolved {
+                    id: crate::GoalNodeId::from("some-node"),
+                    resolution: crate::Resolution::Accepted,
+                },
+            },
+        );
+
+        assert_eq!(state, original, "Goal payload must not change any state");
+    }
+
+    #[test]
     fn non_covered_events_do_not_change_state() {
         let original = SessionState {
             messages: vec![Message::User(UserMessage::text("kept"))],
@@ -356,6 +438,7 @@ mod tests {
             SessionEventPayload::TurnCompleted {
                 turn_id: crate::TurnId::new(),
                 usage: usage(100, 100),
+                goal_node: None,
             },
             SessionEventPayload::TurnFailed {
                 turn_id: crate::TurnId::new(),
@@ -367,6 +450,7 @@ mod tests {
                 delta: crate::DeltaItem {
                     text: "chunk".to_owned(),
                 },
+                goal_node: None,
             },
             SessionEventPayload::SessionShutdownComplete,
         ];
@@ -384,6 +468,7 @@ mod tests {
                 1,
                 SessionEventPayload::MessageItem {
                     message: Message::User(UserMessage::text("one")),
+                    goal_node: None,
                 },
             ),
             committed(
@@ -401,6 +486,7 @@ mod tests {
                 3,
                 SessionEventPayload::MessageItem {
                     message: assistant_message("after", Some(usage(1, 2))),
+                    goal_node: None,
                 },
             ),
         ];
@@ -458,6 +544,7 @@ mod tests {
     fn fold_payload_strategy() -> impl Strategy<Value = SessionEventPayload> {
         let user_message = "[a-zA-Z0-9 ]{0,32}".prop_map(|text| SessionEventPayload::MessageItem {
             message: Message::User(UserMessage::text(text)),
+            goal_node: None,
         });
         let assistant_message = (
             "[a-zA-Z0-9 ]{0,32}",
@@ -477,6 +564,7 @@ mod tests {
                             cache_read_input_tokens: cache_read,
                         }),
                     ),
+                    goal_node: None,
                 }
             });
         let compaction = (
@@ -541,7 +629,10 @@ mod tests {
                 .map(|(offset, message)| {
                     committed(
                         offset as u64 + 1,
-                        SessionEventPayload::MessageItem { message },
+                        SessionEventPayload::MessageItem {
+                            message,
+                            goal_node: None,
+                        },
                     )
                 })
                 .collect();

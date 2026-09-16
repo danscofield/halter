@@ -12,7 +12,9 @@ use halter_protocol::{
     ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEventPayload, SessionId,
     SessionState, ToolCall, ToolSpec, TurnId, Usage,
 };
+use halter_goals::{GoalEvent, GoalStore, GoalStoreError, GoalTree};
 use halter_providers::Provider;
+use halter_session::SessionStore;
 use halter_tools::Tool;
 use tokio_util::sync::CancellationToken;
 
@@ -143,6 +145,93 @@ pub fn compaction_instructions(custom_instructions: Option<&str>) -> String {
     }
 }
 
+/// A per-session, read-only view over the session's [`GoalStore`] and its
+/// goal event log — the folded goal tree plus the goal-tagged events on the
+/// shared session log (Requirements 11.1, 11.2, 11.3).
+///
+/// A [`CompactionStrategy`] is shared by every session and holds
+/// configuration, not per-session state, so per-session goal data must arrive
+/// through the per-session [`CompactionContext`] — the same reason
+/// [`state`](CompactionContext::state) lives there, not on the strategy. This
+/// handle is that seam: [`goal_log`](CompactionContext::goal_log) hands it out
+/// scoped to the one session being compacted, and a goal-oriented consumer
+/// (the follow-on `GoalOrientedCompaction`) reads attribution through it
+/// rather than reaching for a session-keyed lookup of its own.
+///
+/// The handle is **read-only**: it projects the folded [`GoalTree`] and
+/// replays the goal-tagged events, but never mutates the goal tree or the log.
+/// It exists only when goal tracking resolves to `auto` (the session has a
+/// wired [`GoalStore`]); in `off` mode
+/// [`goal_log`](CompactionContext::goal_log) returns `None` and no goal-store
+/// call is made, keeping the byte-identical no-goal path.
+pub struct GoalLog<'a> {
+    /// The session's shared, `SessionStore`-backed goal store — the source of
+    /// the folded goal tree.
+    store: &'a dyn GoalStore,
+    /// The shared session log, replayed to recover the goal-tagged events that
+    /// ride the same sequence space as transcript events.
+    sessions: &'a dyn SessionStore,
+    /// The session this handle is scoped to.
+    session_id: &'a SessionId,
+}
+
+impl<'a> GoalLog<'a> {
+    pub(crate) fn new(
+        store: &'a dyn GoalStore,
+        sessions: &'a dyn SessionStore,
+        session_id: &'a SessionId,
+    ) -> Self {
+        Self {
+            store,
+            sessions,
+            session_id,
+        }
+    }
+
+    /// The session this handle reads from.
+    #[must_use]
+    pub fn session_id(&self) -> &SessionId {
+        self.session_id
+    }
+
+    /// Project the session's folded [`GoalTree`] — the open frontier plus the
+    /// closed subtrees — by folding the session's committed goal events
+    /// (Requirement 11.2). Read-only: no event is appended.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the [`GoalStoreError`] from
+    /// [`GoalStore::get_tree`](halter_goals::GoalStore::get_tree).
+    pub async fn get_tree(&self) -> Result<GoalTree, GoalStoreError> {
+        self.store.get_tree(self.session_id).await
+    }
+
+    /// Replay the session's goal-tagged events — the [`GoalEvent`]s carried on
+    /// `SessionEventPayload::Goal` — in ascending shared-log sequence order
+    /// (Requirement 11.2). These ride the same sequence space as transcript
+    /// events, so a consumer can relate them to the tagged transcript.
+    /// Read-only: the log is not mutated.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any failure replaying the shared session log as a
+    /// [`GoalStoreError::Log`].
+    pub async fn goal_events(&self) -> Result<Vec<GoalEvent>, GoalStoreError> {
+        let events = self
+            .sessions
+            .replay(self.session_id)
+            .await
+            .map_err(|err| GoalStoreError::Log(err.to_string()))?;
+        Ok(events
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                SessionEventPayload::Goal { event } => Some(event),
+                _ => None,
+            })
+            .collect())
+    }
+}
+
 /// Everything a strategy may read and do while compacting one session.
 ///
 /// Reads see the live session: its state (including the token ledger), the
@@ -255,6 +344,28 @@ impl<'a> CompactionContext<'a> {
         self.session.services().tools.specs()
     }
 
+    /// A per-session, read-only [`GoalLog`] over this session's goal store and
+    /// goal event log — the folded goal tree plus the goal-tagged events
+    /// (Requirements 11.1, 11.2, 11.3).
+    ///
+    /// Returns `Some` only when goal tracking resolves to `auto` (the session
+    /// has a wired [`GoalStore`]); in `off` mode it returns `None`, makes no
+    /// goal-store call, and leaves the byte-identical no-goal path untouched.
+    /// The handle is scoped to *this* session's [`CompactionContext`], not to
+    /// the shared, per-session-stateless [`CompactionStrategy`], so a
+    /// goal-oriented consumer reads attribution through the context it is
+    /// already given.
+    #[must_use]
+    pub fn goal_log(&self) -> Option<GoalLog<'_>> {
+        let services = self.session.services();
+        let store = services.goal_store.as_ref()?;
+        Some(GoalLog::new(
+            store.as_ref(),
+            services.sessions.as_ref(),
+            self.session.session_id(),
+        ))
+    }
+
     /// Append a message to the transcript and record it in the event log.
     pub fn append(&mut self, message: Message) {
         self.state.append(message.clone());
@@ -271,12 +382,18 @@ impl<'a> CompactionContext<'a> {
     /// Record a message in the event log without changing the transcript.
     pub fn record(&mut self, message: Message) {
         self.session
-            .push_event(self.events, SessionEventPayload::MessageItem { message });
+            .push_event(self.events, SessionEventPayload::MessageItem { message, goal_node: None });
     }
 
     pub fn warn(&mut self, message: String) {
         self.session
-            .push_event(self.events, SessionEventPayload::Warning { message });
+            .push_event(
+                self.events,
+                SessionEventPayload::Warning {
+                    message,
+                    goal_node: None,
+                },
+            );
     }
 
     /// Run one inference over the current transcript with the session's
@@ -301,7 +418,10 @@ impl<'a> CompactionContext<'a> {
                 .prepare_request(request_tokens, compacted_prefix, messages);
             self.session.push_event(
                 self.events,
-                SessionEventPayload::ContextProjectionUpdated { request_tokens },
+                SessionEventPayload::ContextProjectionUpdated {
+                    request_tokens,
+                    goal_node: None,
+                },
             );
         }
         self.session

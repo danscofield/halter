@@ -25,6 +25,7 @@ arc-swap.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
+halter-goals = { path = "../halter-goals", version = "0.5.0" }
 halter-hooks = { path = "../halter-hooks", version = "0.5.0" }
 halter-protocol = { path = "../halter-protocol", version = "0.5.0" }
 halter-providers = { path = "../halter-providers", version = "0.5.0" }

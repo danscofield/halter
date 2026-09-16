@@ -6,9 +6,11 @@
 //! assembly and tests.
 // pattern: Functional Core
 
+mod active_goal;
 mod clean_window;
 mod compaction;
 mod session_search;
+pub use active_goal::{ActiveGoalStack, FocusError, GoalAttributionMode, stamp_goal_node};
 pub use clean_window::{
     CLEAN_WINDOW_BOOTSTRAP, CLEAN_WINDOW_PROMPT, CleanWindow, ROLLOVER_REMINDER,
 };
@@ -16,6 +18,7 @@ pub use session_search::{SessionSearchBackend, SessionSearchRequest, StoreSearch
 mod compaction_strategy;
 mod context;
 mod event_bus;
+mod goal_oriented_compaction;
 mod hooks_runtime;
 mod model_judge;
 mod model_selection;
@@ -39,6 +42,7 @@ pub use context::{
     CompactionEffects, ContextManager, DefaultContextManager, prompt_segments,
     resolve_response_chain,
 };
+pub use goal_oriented_compaction::GoalOrientedCompaction;
 pub use model_summary::{CHECKPOINT_PREFIX, ModelSummary, TODO_NUDGE, TODO_REMINDER};
 pub use provider_default::ProviderDefault;
 

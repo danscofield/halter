@@ -17,7 +17,10 @@
 //!   `resolution_conditions`, `tool_calls`, and/or `children` when `Some`. A
 //!   revision that changes the resolved subtree invalidates prior closure, so
 //!   the node and its ancestors have their stored `subtree_hash` cleared
-//!   (Requirements 2.3, 2.4).
+//!   (Requirements 2.3, 2.4). `GoalNodeRevised` is the **only** fold path that
+//!   ever writes `tool_calls`: the field is an agent-curated convenience
+//!   projection, never auto-populated from `goal_node`-tagged tool events on
+//!   the shared log (Requirements 9.1, 9.2).
 //! - [`GoalEvent::GoalNodeResolved`] sets the node's resolution. Setting it back
 //!   to `Open` re-opens the node and supersedes any previously computed closure
 //!   for the node and its ancestors (their `subtree_hash` is cleared); setting a
@@ -95,6 +98,10 @@ pub fn apply_goal_event(tree: &mut GoalTree, event: &GoalEvent) {
                 node.resolution_conditions = conditions.clone();
             }
             if let Some(tool_calls) = &revision.tool_calls {
+                // The sole write path for `tool_calls`. It is an agent-curated
+                // convenience projection carried by the `revise` action, never
+                // auto-populated from `goal_node`-tagged tool events on the
+                // shared log (Requirements 9.1, 9.2).
                 node.tool_calls = tool_calls.clone();
             }
             if let Some(children) = &revision.children {
@@ -341,6 +348,75 @@ mod tests {
             assert_eq!(h1, h2);
             assert!(h1.is_some(), "closed node {id} carries a subtree_hash");
         }
+    }
+
+    #[test]
+    fn tool_calls_are_only_populated_via_revise_never_auto_populated() {
+        // Requirements 9.1, 9.2: the `goal_node` tag on the shared log is the
+        // sole attribution source of truth; `GoalNode.tool_calls` is an
+        // agent-curated convenience projection that is populated ONLY by the
+        // `revise` action (a GoalNodeRevised event) and is NEVER auto-populated
+        // from tagged tool events. This guard exercises every non-`revise`
+        // goal-tree mutation and asserts none of them ever writes `tool_calls`.
+        //
+        // Create -> resolve -> close leaves `tool_calls` empty, even though the
+        // node has been fully closed (the point at which tagged tool events for
+        // the node would exist on the shared log). Attribution rode the tag, not
+        // this field.
+        let events = vec![
+            created("root", None),
+            created("child", Some("root")),
+            resolved("child", Resolution::Accepted),
+            resolved("root", Resolution::Accepted),
+            closed("child"),
+            closed("root"),
+        ];
+        let tree = fold_goal_events(GoalTree::new(), &events);
+        for id in ["root", "child"] {
+            let node = tree.node(&GoalNodeId::from(id)).unwrap();
+            assert!(
+                node.tool_calls.is_empty(),
+                "no non-revise event may populate tool_calls for {id} (9.1, 9.2)"
+            );
+        }
+
+        // Only a GoalNodeRevised carrying `tool_calls` populates the field...
+        let mut tree = tree;
+        apply_goal_event(
+            &mut tree,
+            &GoalEvent::GoalNodeRevised {
+                id: GoalNodeId::from("child"),
+                revision: GoalNodeRevision {
+                    resolution_conditions: None,
+                    tool_calls: Some(vec![tool_call("child")]),
+                    children: None,
+                },
+            },
+        );
+        assert_eq!(
+            tree.node(&GoalNodeId::from("child")).unwrap().tool_calls.len(),
+            1,
+            "the revise action is the sole tool_calls write path (9.2)"
+        );
+
+        // ...and a revise that omits `tool_calls` (None) leaves the curated
+        // value untouched — it is never cleared or auto-refreshed from events.
+        apply_goal_event(
+            &mut tree,
+            &GoalEvent::GoalNodeRevised {
+                id: GoalNodeId::from("child"),
+                revision: GoalNodeRevision {
+                    resolution_conditions: Some(vec!["another condition".to_owned()]),
+                    tool_calls: None,
+                    children: None,
+                },
+            },
+        );
+        assert_eq!(
+            tree.node(&GoalNodeId::from("child")).unwrap().tool_calls.len(),
+            1,
+            "a revise without tool_calls must not disturb the curated projection"
+        );
     }
 
     #[test]

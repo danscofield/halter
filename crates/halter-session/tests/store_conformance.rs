@@ -304,6 +304,7 @@ async fn fold_of_full_log_matches_state_checkpoint() {
                     SessionEventPayload::TurnCompleted {
                         turn_id: halter_protocol::TurnId::new(),
                         usage: assistant_usage(12, 4),
+                        goal_node: None,
                     },
                 ),
             ],
@@ -423,7 +424,10 @@ fn message_event(message: Message) -> PendingEvent {
     PendingEvent::new(
         SessionId::from("overwritten-by-store"),
         Delivery::Lossless,
-        SessionEventPayload::MessageItem { message },
+        SessionEventPayload::MessageItem {
+            message,
+            goal_node: None,
+        },
     )
 }
 

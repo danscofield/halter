@@ -1236,6 +1236,19 @@ pub enum CompactionStrategyKind {
     CleanWindow,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// Whether the runtime tracks goals at runtime (`context.goal_tracking`).
+pub enum GoalTrackingMode {
+    /// Goal Model dormant; today's behavior with zero per-turn overhead. The
+    /// default. No goal tool is registered and no attribution tag is stamped.
+    #[default]
+    Off,
+    /// The runtime maintains the active-goal pointer, tags turn-attributable
+    /// events with the owning goal node, and installs the goal tool.
+    Auto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 /// Context window thresholds and the compaction strategy. Both thresholds
@@ -1259,6 +1272,9 @@ pub struct ContextConfig {
     /// Durable CleanWindow notes root, independent of session working directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_root: Option<PathBuf>,
+    /// Whether the runtime tracks goals at runtime. Defaults to `off`.
+    #[serde(default)]
+    pub goal_tracking: GoalTrackingMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1268,6 +1284,7 @@ pub struct ResolvedContextConfig {
     pub compaction_threshold: u64,
     pub max_tokens: Option<u64>,
     pub compaction: CompactionStrategyKind,
+    pub goal_tracking: GoalTrackingMode,
 }
 
 impl ContextConfig {
@@ -1316,6 +1333,7 @@ impl ContextConfig {
             compaction_threshold,
             max_tokens,
             compaction: self.compaction,
+            goal_tracking: self.goal_tracking,
         })
     }
 }
@@ -2886,6 +2904,7 @@ port = 9090
                 compaction_threshold: 200_000 - COMPACTION_HEADROOM_TOKENS,
                 max_tokens: Some(200_000),
                 compaction: CompactionStrategyKind::ModelSummary,
+                goal_tracking: GoalTrackingMode::Off,
             }
         );
     }
@@ -2897,6 +2916,7 @@ port = 9090
             max_tokens: Some(150_000),
             compaction: CompactionStrategyKind::ProviderDefault,
             notes_root: None,
+            goal_tracking: GoalTrackingMode::default(),
         }
         .resolve(Some(200_000))
         .expect("resolves");
@@ -2907,6 +2927,7 @@ port = 9090
                 compaction_threshold: 100_000,
                 max_tokens: Some(150_000),
                 compaction: CompactionStrategyKind::ProviderDefault,
+                goal_tracking: GoalTrackingMode::Off,
             }
         );
     }

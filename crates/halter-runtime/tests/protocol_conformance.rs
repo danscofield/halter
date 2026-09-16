@@ -121,6 +121,7 @@ fn session_event_payload_variants_have_stable_kind() {
         SessionEventPayload::SessionResumed,
         SessionEventPayload::Warning {
             message: "w".into(),
+            goal_node: None,
         },
         SessionEventPayload::TurnStarted {
             turn_id: TurnId::from("t1"),
@@ -134,8 +135,12 @@ fn session_event_payload_variants_have_stable_kind() {
                 usage: Some(Usage::default()),
                 replay_meta: Default::default(),
             }),
+            goal_node: None,
         },
-        SessionEventPayload::ContextProjectionUpdated { request_tokens: 42 },
+        SessionEventPayload::ContextProjectionUpdated {
+            request_tokens: 42,
+            goal_node: None,
+        },
         SessionEventPayload::ContextRestored {
             reason: "r".to_owned(),
             effects: Box::new(halter_protocol::RestoredContext {
@@ -148,15 +153,20 @@ fn session_event_payload_variants_have_stable_kind() {
             delta: DeltaItem {
                 text: "d".to_owned(),
             },
+            goal_node: None,
         },
         SessionEventPayload::ProviderMetadata {
             metadata: r#"{"openai_chatgpt_moderation_metadata":{}}"#.to_owned(),
         },
-        SessionEventPayload::ToolExecutionStarted { call: call.clone() },
+        SessionEventPayload::ToolExecutionStarted {
+            call: call.clone(),
+            goal_node: None,
+        },
         SessionEventPayload::ToolOutput {
             call_id: call.id.clone(),
             tool_name: call.name.clone(),
             chunk: "".into(),
+            goal_node: None,
         },
         SessionEventPayload::HookStarted {
             run: hook_run.clone(),
@@ -164,7 +174,10 @@ fn session_event_payload_variants_have_stable_kind() {
         SessionEventPayload::HookCompleted {
             run: hook_run.clone(),
         },
-        SessionEventPayload::ToolExecutionCompleted { outcome },
+        SessionEventPayload::ToolExecutionCompleted {
+            outcome,
+            goal_node: None,
+        },
         SessionEventPayload::ApprovalRequested {
             tool_name: call.name.clone(),
             reason: "r".into(),
@@ -184,6 +197,7 @@ fn session_event_payload_variants_have_stable_kind() {
         SessionEventPayload::TurnCompleted {
             turn_id: TurnId::from("t1"),
             usage: Usage::default(),
+            goal_node: None,
         },
         SessionEventPayload::TurnFailed {
             turn_id: TurnId::from("t1"),
@@ -220,6 +234,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::TurnFailed { .. } => "turn_failed",
             SessionEventPayload::Lagged { .. } => "lagged",
             SessionEventPayload::SessionShutdownComplete => "session_shutdown_complete",
+            SessionEventPayload::Goal { .. } => "goal",
         };
         let json = serde_json::to_value(&event.payload).expect("serialize");
         assert_eq!(

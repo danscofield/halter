@@ -11,8 +11,8 @@ use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
     AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
-    ContextPlan, Delivery, HookSessionStartSource, HookWarning, Message, MessageId, ModelId,
-    ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
+    ContextPlan, Delivery, GoalNodeId, HookSessionStartSource, HookWarning, Message, MessageId,
+    ModelId, ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
     PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
     SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
     StreamEvent, SubagentEventForwarding, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome,
@@ -33,6 +33,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::model_selection::select_models;
 use crate::turn_registry::TurnRegistry;
+use crate::active_goal::{ActiveGoalStack, GoalAttributionMode, stamp_goal_node};
+use halter_goals::{GoalStore, GoalStoreError};
 use crate::{
     CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
     ContextSettings, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
@@ -92,6 +94,16 @@ pub struct RuntimeServices {
     /// per-session JSONL trace file. Disabled (`None`) when
     /// `runtime.traces_dir` is not configured.
     pub trace_recorder: Option<Arc<crate::TraceRecorder>>,
+    /// Whether the runtime tracks goals (`[context].goal_tracking`). When
+    /// `Auto`, each new [`SessionHandle`] installs the auto-mode attribution
+    /// context wired to [`goal_store`](Self::goal_store) so the chokepoint
+    /// stamps `goal_node` and the lazy root is created on first use. `Off`
+    /// (the default) keeps the chokepoint byte-identical to today.
+    pub goal_tracking: GoalAttributionMode,
+    /// The shared, `SessionStore`-backed [`GoalStore`] every session installs
+    /// its attribution context over when `goal_tracking = Auto`. `None` in
+    /// `off` mode, so no attribution is installed.
+    pub goal_store: Option<Arc<dyn GoalStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +293,127 @@ pub struct SessionHandle {
     /// see `EvictionGuard`.
     #[allow(dead_code)]
     eviction: Arc<EvictionGuard>,
+    /// The chokepoint attribution seam (task 6.1). When goal tracking is `off`
+    /// (the default) this is `None`, so `make_event` performs no stack read and
+    /// no stamping — the payload is emitted with `goal_node = None` exactly as
+    /// today (Requirements 1.4, 2.1, 2.4). When goal tracking is `auto`, task
+    /// 9.1 installs a context here whose `active` node the chokepoint stamps
+    /// onto every turn-attributable payload.
+    goal_attribution: Option<Arc<Mutex<GoalAttributionContext>>>,
+}
+
+/// Per-session chokepoint attribution state consulted by `make_event`.
+///
+/// This is the seam task 6.1 introduces so the chokepoint can read the active
+/// goal node without yet owning the full wiring. It carries the runtime
+/// [`GoalAttributionMode`] flag, the session's [`ActiveGoalStack`], and — when
+/// `auto` — the [`GoalStore`] handle the stack's lazy [`ensure_root`] needs. The
+/// cached `active` node id is the value the sync chokepoint (`make_event`)
+/// stamps; it mirrors the top of the stack so the read stays lock-cheap and
+/// sync.
+///
+/// # The sync/async split (task 6.2)
+///
+/// [`ActiveGoalStack::ensure_root`] is async (it may append a `GoalNodeCreated`
+/// event through the [`GoalStore`]), but `make_event` is sync. Following the
+/// design (§ "Component 1: Root is lazy and total"), the root is created at an
+/// async point — turn start, or the first goal-tool call — via
+/// [`ensure_root_stamped`], which populates `active`. The sync chokepoint then
+/// only *reads* the already-populated `active`, never touching the store.
+///
+/// The goal tool (task 8) and builder wiring (task 9.1) keep `active`/`stack` in
+/// sync with advancement; lazy root creation (task 6.2) sets them on first use.
+/// Until the root exists `active` stays `None` and stamping is a no-op that
+/// leaves `goal_node = None` — the graceful-degradation shape when
+/// [`ensure_root`] fails as well (Requirement 10.2).
+///
+/// [`ensure_root`]: ActiveGoalStack::ensure_root
+#[derive(Clone, Default)]
+pub(crate) struct GoalAttributionContext {
+    /// Whether the chokepoint stamps at all.
+    mode: GoalAttributionMode,
+    /// The active goal node (top of the `stack`), or `None` before the root
+    /// exists. This is the value the sync chokepoint stamps; it is kept in sync
+    /// with `stack.active()`.
+    active: Option<GoalNodeId>,
+    /// The session's active-goal stack (root at index 0, top is active). Runtime
+    /// bookkeeping; `ensure_root` lazily creates and pushes the root here.
+    stack: ActiveGoalStack,
+    /// The goal store the stack's lazy `ensure_root` uses to create the root.
+    /// `None` in `off` mode (and in task-6.1-era tests that install only a
+    /// mode + active). When absent, `ensure_root_stamped` degrades gracefully.
+    store: Option<Arc<dyn GoalStore>>,
+}
+
+impl std::fmt::Debug for GoalAttributionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoalAttributionContext")
+            .field("mode", &self.mode)
+            .field("active", &self.active)
+            .field("stack", &self.stack)
+            .field("store", &self.store.as_ref().map(|_| "<dyn GoalStore>"))
+            .finish()
+    }
+}
+
+impl GoalAttributionContext {
+    /// Build an `auto`-mode context wired to the shared session [`GoalStore`],
+    /// with an empty stack whose root is created lazily on first use via
+    /// [`ensure_goal_root`](SessionHandle::ensure_goal_root). This is the shape
+    /// task 9.1 installs for every new session when `goal_tracking = Auto`.
+    fn auto(store: Arc<dyn GoalStore>) -> Self {
+        Self {
+            mode: GoalAttributionMode::Auto,
+            active: None,
+            stack: ActiveGoalStack::new(),
+            store: Some(store),
+        }
+    }
+
+    /// Build an `auto`-mode context whose [`ActiveGoalStack`] has been rehydrated
+    /// from the session's folded goal tree on resume, so attribution resumes at
+    /// the previously-active node rather than at a freshly-created root
+    /// (Requirement 6.5).
+    ///
+    /// The `stack` is expected to have been rehydrated via
+    /// [`ActiveGoalStack::rehydrate`]; `active` is seeded from it so the sync
+    /// chokepoint stamps the resumed node immediately, and `ensure_goal_root`
+    /// becomes a cheap no-op because the root already exists. When the tree was
+    /// empty (a session that never created a goal), the passed stack is empty and
+    /// this behaves exactly like [`auto`](Self::auto) — the lazy root path still
+    /// creates the root on first use.
+    fn auto_rehydrated(store: Arc<dyn GoalStore>, stack: ActiveGoalStack) -> Self {
+        let active = stack.active().cloned();
+        Self {
+            mode: GoalAttributionMode::Auto,
+            active,
+            stack,
+            store: Some(store),
+        }
+    }
+
+    /// The active node the chokepoint stamps, or `None` when stamping is off or
+    /// the root does not yet exist.
+    fn active_node(&self) -> Option<&GoalNodeId> {
+        if self.mode.is_auto() {
+            self.active.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Whether goal tracking is `auto` for this context.
+    fn is_auto(&self) -> bool {
+        self.mode.is_auto()
+    }
+
+    /// Update the active node the chokepoint stamps. Called by the goal tool /
+    /// turn loop to keep this context in sync with the session's
+    /// `ActiveGoalStack` (lazy root in task 6.2, advancement in task 8).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_active(&mut self, active: Option<GoalNodeId>) {
+        self.active = active;
+    }
 }
 
 /// Backwards-compatible alias for the public session type. Prefer
@@ -542,6 +675,18 @@ impl SessionRuntime {
         self.subagents.clone()
     }
 
+    /// Specs of every tool registered on the runtime.
+    #[must_use]
+    pub fn tool_specs(&self) -> Vec<halter_protocol::ToolSpec> {
+        self.services.tools.specs()
+    }
+
+    /// Whether goal tracking is enabled (`[context].goal_tracking = auto`).
+    #[must_use]
+    pub fn goal_tracking_enabled(&self) -> bool {
+        self.services.goal_tracking.is_auto()
+    }
+
     /// Create and persist a new session.
     pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
         debug!(
@@ -601,10 +746,13 @@ impl SessionRuntime {
                     .forward_to_ancestors(&forwarding_ancestors, &event);
                 self.services.event_bus.publish(event);
             }
-            return Ok(Some(HalterSession::new(
-                self.services.clone(),
-                session_id.clone(),
-            )?));
+            let handle = HalterSession::new(self.services.clone(), session_id.clone())?;
+            // Rehydrate the active-goal stack from the session's persisted goal
+            // events so attribution resumes at the previously-active node rather
+            // than a freshly-created duplicate root (Requirement 6.5). A no-op in
+            // off mode and for sessions that never created a goal.
+            handle.rehydrate_goal_attribution().await;
+            return Ok(Some(handle));
         }
         Ok(None)
     }
@@ -654,12 +802,99 @@ impl SessionHandle {
         session_id: SessionId,
     ) -> anyhow::Result<Self> {
         let (session_hooks, eviction) = lookup_or_create_session_hooks(&services, &session_id)?;
+        // Goal tracking is off by default: the chokepoint stamps nothing and
+        // the off-path stays byte-identical to today. When services carry
+        // `goal_tracking = Auto` and a goal store (task 9.1 wiring from the
+        // builder), install the auto-mode attribution context wired to that
+        // shared store so the chokepoint stamps `goal_node` and the lazy root
+        // is created on first use.
+        let goal_attribution = match (&services.goal_tracking, &services.goal_store) {
+            (mode, Some(store)) if mode.is_auto() => Some(Arc::new(Mutex::new(
+                GoalAttributionContext::auto(store.clone()),
+            ))),
+            _ => None,
+        };
         Ok(Self {
             services,
             session_id,
             session_hooks,
             eviction,
+            goal_attribution,
         })
+    }
+
+    /// Rehydrate the active-goal stack from the session's persisted goal events
+    /// on resume, so attribution resumes at the previously-active node rather
+    /// than at a freshly-created duplicate root (Requirement 6.5).
+    ///
+    /// When goal tracking is `auto`, this folds the session's `Goal` events into
+    /// a [`GoalTree`] via the shared [`GoalStore`] and reconstructs the
+    /// root→active path (see [`ActiveGoalStack::rehydrate`] for the
+    /// reconstruction the design permits). The rehydrated stack replaces the
+    /// empty auto-mode context [`new`](Self::new) installs, so the root already
+    /// exists (`ensure_goal_root` becomes a no-op) and the first resumed turn
+    /// attributes to the resumed root.
+    ///
+    /// In `off` mode, or for a session whose folded tree is empty (it never
+    /// created a goal), this is a no-op: the empty context is left in place and
+    /// the lazy root path still creates the root on first use exactly as for a
+    /// fresh session.
+    ///
+    /// A goal-store failure while folding degrades gracefully: a warning is
+    /// logged and the empty auto context is kept, so the lazy root path recreates
+    /// the root on first use and the resume never fails.
+    async fn rehydrate_goal_attribution(&self) {
+        // Only auto-mode sessions with a wired goal store have anything to
+        // rehydrate; off mode keeps the byte-identical no-goal path.
+        let (GoalAttributionMode::Auto, Some(store)) =
+            (&self.services.goal_tracking, &self.services.goal_store)
+        else {
+            return;
+        };
+        let Some(attribution) = &self.goal_attribution else {
+            return;
+        };
+
+        // Fold the session's persisted Goal events into the tree, then
+        // reconstruct the root→active path from it.
+        let tree = match store.get_tree(&self.session_id).await {
+            Ok(tree) => tree,
+            Err(error) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %error,
+                    "failed to fold goal tree on resume; deferring root to lazy creation"
+                );
+                return;
+            }
+        };
+
+        let mut stack = ActiveGoalStack::new();
+        if !stack.rehydrate(&tree) {
+            // Empty tree: nothing persisted yet, leave the lazy path to create
+            // the root on first use.
+            return;
+        }
+
+        let mut context = attribution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *context = GoalAttributionContext::auto_rehydrated(store.clone(), stack);
+    }
+
+    /// Test-only snapshot of the active goal node the chokepoint would stamp,
+    /// used to assert rehydration on resume (task 9.2).
+    #[cfg(test)]
+    pub(crate) fn goal_active_node(&self) -> Option<GoalNodeId> {
+        self.goal_attribution
+            .as_ref()
+            .and_then(|attribution| {
+                attribution
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .active
+                    .clone()
+            })
     }
 
     /// Session id for this handle.
@@ -670,6 +905,151 @@ impl SessionHandle {
 
     pub(crate) fn services(&self) -> &Arc<RuntimeServices> {
         &self.services
+    }
+
+    /// Install the chokepoint attribution context so `make_event` stamps
+    /// `goal_node = active` onto turn-attributable payloads (task 6.1 seam).
+    ///
+    /// Task 9.1 calls this when `goal_tracking = auto` to turn stamping on;
+    /// leaving it uncalled keeps the off-path byte-identical to today. Returns
+    /// the shared handle so callers (the goal tool / turn loop) can keep the
+    /// active node in sync with the session's `ActiveGoalStack`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn install_goal_attribution(
+        &mut self,
+        mode: GoalAttributionMode,
+        active: Option<GoalNodeId>,
+    ) -> Arc<Mutex<GoalAttributionContext>> {
+        let context = Arc::new(Mutex::new(GoalAttributionContext {
+            mode,
+            active,
+            stack: ActiveGoalStack::new(),
+            store: None,
+        }));
+        self.goal_attribution = Some(context.clone());
+        context
+    }
+
+    /// Install the chokepoint attribution context wired with the session's
+    /// [`ActiveGoalStack`] and the [`GoalStore`] its lazy root creation needs
+    /// (task 6.2 / task 9.1).
+    ///
+    /// This is the `auto`-mode variant of [`install_goal_attribution`]: the
+    /// returned context can lazily create the root at an async point via
+    /// [`ensure_goal_root`]. When `mode` is `off` the store is ignored and the
+    /// chokepoint never stamps (`goal_node = None`), preserving the byte-identical
+    /// off-path.
+    ///
+    /// [`install_goal_attribution`]: Self::install_goal_attribution
+    /// [`ensure_goal_root`]: Self::ensure_goal_root
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn install_goal_attribution_with_store(
+        &mut self,
+        mode: GoalAttributionMode,
+        stack: ActiveGoalStack,
+        store: Arc<dyn GoalStore>,
+    ) -> Arc<Mutex<GoalAttributionContext>> {
+        let active = stack.active().cloned();
+        let store = mode.is_auto().then_some(store);
+        let context = Arc::new(Mutex::new(GoalAttributionContext {
+            mode,
+            active,
+            stack,
+            store,
+        }));
+        self.goal_attribution = Some(context.clone());
+        context
+    }
+
+    /// Lazily create the per-session root goal so the chokepoint can attribute
+    /// events to it (Requirements 4.1, 4.2).
+    ///
+    /// Called at an async point (turn start, or the first goal-tool call)
+    /// *before* any turn-attributable event is stamped. On the first successful
+    /// call it creates the root via [`GoalStore`] and populates the context's
+    /// `active` node, so the sync chokepoint (`make_event`) then reads a
+    /// populated `active` for the rest of the session. Subsequent calls are
+    /// cheap no-ops once the root exists.
+    ///
+    /// When goal tracking is `off`, or no store is wired, this is a no-op and
+    /// returns `Ok(())` — attribution stays off exactly as today.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the [`GoalStoreError`] from [`ActiveGoalStack::ensure_root`].
+    /// The context is left unchanged on error (`active` stays `None`), so the
+    /// caller degrades gracefully: the event is emitted with `goal_node = None`,
+    /// a `Warning` is emitted, and the turn is neither blocked nor failed
+    /// (Requirement 10.2). See [`ensure_goal_root`](Self::ensure_goal_root) for
+    /// the wrapper the turn loop uses that performs that degradation.
+    async fn ensure_goal_root_inner(&self) -> Result<(), GoalStoreError> {
+        // Snapshot the pieces we need under the lock, then release it before the
+        // async store call (the `Mutex` is a std sync mutex, not held across
+        // `.await`).
+        let (mut stack, store) = {
+            let Some(attribution) = &self.goal_attribution else {
+                return Ok(());
+            };
+            let context = attribution
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !context.is_auto() || context.stack.is_initialized() {
+                // Off, or the root already exists — nothing to do.
+                return Ok(());
+            }
+            let Some(store) = context.store.clone() else {
+                // No store wired (e.g. task-6.1-era test context): degrade to a
+                // no-op rather than fail.
+                return Ok(());
+            };
+            (context.stack.clone(), store)
+        };
+
+        let root = stack.ensure_root(store.as_ref(), &self.session_id).await?;
+
+        // Re-acquire the lock and publish the created root, but only if another
+        // caller has not raced ahead and initialized it first.
+        if let Some(attribution) = &self.goal_attribution {
+            let mut context = attribution
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !context.stack.is_initialized() {
+                context.stack = stack;
+                context.active = Some(root);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure the root goal exists at an async point, degrading gracefully on
+    /// failure by emitting a `Warning` (Requirement 10.2).
+    ///
+    /// This is the turn-loop wrapper around [`ensure_goal_root_inner`]: on a
+    /// [`GoalStoreError`] it pushes a `Warning` onto `events` (so callers commit
+    /// it alongside the turn's other events) and returns without failing —
+    /// attribution simply stays `goal_node = None` for the session's events
+    /// until a later attempt succeeds. In `off` mode it is a no-op.
+    ///
+    /// [`ensure_goal_root_inner`]: Self::ensure_goal_root_inner
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn ensure_goal_root(&self, events: &mut Vec<PendingEvent>) {
+        if let Err(error) = self.ensure_goal_root_inner().await {
+            warn!(
+                session_id = %self.session_id,
+                error = %error,
+                "failed to create root goal; degrading attribution to goal_node = None"
+            );
+            // Emit a Warning but never block or fail the turn (Requirement 10.2).
+            self.push_event(
+                events,
+                SessionEventPayload::Warning {
+                    message: format!(
+                        "goal tracking: failed to create the root goal; continuing without goal attribution for this turn: {error}"
+                    ),
+                    goal_node: None,
+                },
+            );
+        }
     }
 
     pub(crate) fn session_hooks(&self) -> &Arc<Hooks> {
@@ -755,16 +1135,22 @@ impl SessionHandle {
             let _parent_stream_registration = parent_stream_registration;
 
             let blueprint = stored.blueprint.clone();
-            let started = session.make_event(SessionEventPayload::TurnStarted {
-                turn_id: turn.id.clone(),
-            });
+            let mut start_events =
+                vec![session.make_event(SessionEventPayload::TurnStarted {
+                    turn_id: turn.id.clone(),
+                })];
+            // Lazily create the per-session root goal at this async point so the
+            // sync chokepoint can attribute the turn's events to it (Requirement
+            // 4.1). On failure this pushes a `Warning` and never blocks the turn
+            // (Requirement 10.2); in `off` mode it is a no-op.
+            session.ensure_goal_root(&mut start_events).await;
             let start_head = match session
                 .commit_and_publish(
                     &blueprint,
                     None,
                     Some(stored.head_sequence),
                     None,
-                    vec![started],
+                    start_events,
                     Some(live.as_ref()),
                 )
                 .await
@@ -911,7 +1297,7 @@ impl SessionHandle {
             warn!(session_id = %self.session_id, reason, "hooks.ignored_block");
         }
         for message in apply_hook_side_effects(&mut state, &dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
         self.push_event(&mut events, SessionEventPayload::SessionShutdownComplete);
         let _ = self
@@ -966,7 +1352,7 @@ impl SessionHandle {
         let mut events = Vec::new();
         self.record_hook_dispatch(&mut events, &dispatch);
         for message in apply_hook_side_effects(&mut state, &dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
         let _ = self
             .commit_and_publish(
@@ -1028,7 +1414,7 @@ impl SessionHandle {
         track_fired_hook_ids(&mut fired_hook_ids, &pre_dispatch);
         self.record_hook_dispatch(&mut events, &pre_dispatch);
         for message in apply_hook_side_effects(&mut state, &pre_dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
         if pre_dispatch.merged.block_reason.is_some() {
             let _ = self
@@ -1106,7 +1492,7 @@ impl SessionHandle {
             run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary).await?;
         self.record_hook_dispatch(&mut events, &post_dispatch);
         for message in apply_hook_side_effects(&mut state, &post_dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
 
         let _ = self
@@ -1157,6 +1543,7 @@ impl SessionHandle {
                 &mut events,
                 SessionEventPayload::Warning {
                     message: format_hook_warning(&warning),
+                    goal_node: None,
                 },
             );
         }
@@ -1175,7 +1562,7 @@ impl SessionHandle {
                 );
             }
             for message in apply_hook_side_effects(&mut state, &hook_dispatch) {
-                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
             }
         }
 
@@ -1189,7 +1576,7 @@ impl SessionHandle {
         track_fired_hook_ids(&mut fired_hook_ids, &prompt_dispatch);
         self.record_hook_dispatch(&mut events, &prompt_dispatch);
         for message in apply_hook_side_effects(&mut state, &prompt_dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
 
         if let Some(reason) = prompt_dispatch
@@ -1206,11 +1593,15 @@ impl SessionHandle {
             state.append(blocked.clone());
             self.push_event(
                 &mut events,
-                SessionEventPayload::MessageItem { message: blocked },
+                SessionEventPayload::MessageItem {
+                    message: blocked,
+                    goal_node: None,
+                },
             );
             events.push(self.make_event(SessionEventPayload::TurnCompleted {
                 turn_id: turn.id,
                 usage: turn_usage,
+                goal_node: None,
             }));
             return Ok(TurnCommit {
                 expected_head,
@@ -1241,6 +1632,7 @@ impl SessionHandle {
             &mut events,
             SessionEventPayload::MessageItem {
                 message: user_message,
+                goal_node: None,
             },
         );
         self.flush_turn_progress(
@@ -1405,6 +1797,7 @@ impl SessionHandle {
                 &mut events,
                 SessionEventPayload::MessageItem {
                     message: assistant_message,
+                    goal_node: None,
                 },
             );
 
@@ -1458,7 +1851,7 @@ impl SessionHandle {
                 track_fired_hook_ids(&mut fired_hook_ids, &stop_dispatch);
                 self.record_hook_dispatch(&mut events, &stop_dispatch);
                 for message in apply_hook_side_effects(&mut state, &stop_dispatch) {
-                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
                 }
                 if let Some(reason) = stop_dispatch.merged.block_reason.clone() {
                     let continuation = Message::User(halter_protocol::UserMessage::text(
@@ -1473,6 +1866,7 @@ impl SessionHandle {
                         &mut events,
                         SessionEventPayload::MessageItem {
                             message: continuation,
+                            goal_node: None,
                         },
                     );
                     self.flush_turn_progress(
@@ -1534,6 +1928,7 @@ impl SessionHandle {
                 events.push(self.make_event(SessionEventPayload::TurnCompleted {
                     turn_id: turn.id,
                     usage: turn_usage,
+                    goal_node: None,
                 }));
                 return Ok(TurnCommit {
                     expected_head,
@@ -1614,7 +2009,7 @@ impl SessionHandle {
                 track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
                 self.record_hook_dispatch(&mut events, &pre_dispatch);
                 for message in apply_hook_side_effects(state, &pre_dispatch) {
-                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
                 }
                 if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
                     call.arguments = updated_input;
@@ -1627,7 +2022,10 @@ impl SessionHandle {
                 );
                 self.push_event(
                     &mut events,
-                    SessionEventPayload::ToolExecutionStarted { call: call.clone() },
+                    SessionEventPayload::ToolExecutionStarted {
+                        call: call.clone(),
+                        goal_node: None,
+                    },
                 );
 
                 if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
@@ -1646,9 +2044,9 @@ impl SessionHandle {
                     state.append(message.clone());
                     self.push_event(
                         &mut events,
-                        SessionEventPayload::ToolExecutionCompleted { outcome },
+                        SessionEventPayload::ToolExecutionCompleted { outcome, goal_node: None },
                     );
-                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
                     continue;
                 }
 
@@ -1754,7 +2152,7 @@ impl SessionHandle {
                     track_fired_hook_ids(fired_hook_ids, &post_dispatch);
                     self.record_hook_dispatch(&mut events, &post_dispatch);
                     for message in apply_hook_side_effects(state, &post_dispatch) {
-                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                        self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
                     }
                     if let Some(updated_output) = post_dispatch.merged.updated_output {
                         content = tool_result_from_hook_value(updated_output);
@@ -1776,7 +2174,7 @@ impl SessionHandle {
                     track_fired_hook_ids(fired_hook_ids, &post_dispatch);
                     self.record_hook_dispatch(&mut events, &post_dispatch);
                     for message in apply_hook_side_effects(state, &post_dispatch) {
-                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                        self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
                     }
                 }
                 let outcome = ToolExecutionOutcome {
@@ -1795,9 +2193,9 @@ impl SessionHandle {
                 state.append(message.clone());
                 self.push_event(
                     &mut events,
-                    SessionEventPayload::ToolExecutionCompleted { outcome },
+                    SessionEventPayload::ToolExecutionCompleted { outcome, goal_node: None },
                 );
-                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message, goal_node: None });
             }
         }
 
@@ -1887,7 +2285,10 @@ impl SessionHandle {
             .prepare_request(request_tokens, compacted_prefix, messages);
         self.push_event(
             events,
-            SessionEventPayload::ContextProjectionUpdated { request_tokens },
+            SessionEventPayload::ContextProjectionUpdated {
+                request_tokens,
+                goal_node: None,
+            },
         );
     }
 
@@ -2003,7 +2404,7 @@ impl SessionHandle {
             }
             let message = notification.message;
             state.append(message.clone());
-            self.push_event(events, SessionEventPayload::MessageItem { message });
+            self.push_event(events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
 
         let clean_window =
@@ -2073,7 +2474,7 @@ impl SessionHandle {
         track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
         self.record_hook_dispatch(events, &pre_dispatch);
         for message in apply_hook_side_effects(state, &pre_dispatch) {
-            self.push_event(events, SessionEventPayload::MessageItem { message });
+            self.push_event(events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
         if let Some(reason) = pre_dispatch.merged.block_reason {
             if self.services.compaction.window_policy() == crate::WindowPolicy::CleanWindow {
@@ -2085,6 +2486,7 @@ impl SessionHandle {
                     message: format!(
                         "automatic compaction blocked by a PreCompact hook; continuing with an uncompacted context: {reason}"
                     ),
+                    goal_node: None,
                 },
             );
             return Ok(());
@@ -2148,6 +2550,7 @@ impl SessionHandle {
                         message: format!(
                             "automatic compaction did not run; continuing with an uncompacted context: {error:#}"
                         ),
+                        goal_node: None,
                     },
                 );
                 return Ok(());
@@ -2165,7 +2568,7 @@ impl SessionHandle {
         track_fired_hook_ids(fired_hook_ids, &post_dispatch);
         self.record_hook_dispatch(events, &post_dispatch);
         for message in apply_hook_side_effects(state, &post_dispatch) {
-            self.push_event(events, SessionEventPayload::MessageItem { message });
+            self.push_event(events, SessionEventPayload::MessageItem { message, goal_node: None });
         }
         Ok(())
     }
@@ -2320,7 +2723,17 @@ impl SessionHandle {
         }
     }
 
-    fn make_event(&self, payload: SessionEventPayload) -> PendingEvent {
+    fn make_event(&self, mut payload: SessionEventPayload) -> PendingEvent {
+        // Attribution seam (task 6.1): when goal tracking is `auto`, stamp
+        // `goal_node = active()` onto turn-attributable payloads. When `off`
+        // (the default, `goal_attribution == None`) this is skipped entirely —
+        // no stack read, no goal-store call — so the payload is emitted with
+        // `goal_node = None` exactly as today (Requirements 2.1, 2.4, 3.1, 3.3).
+        if let Some(attribution) = &self.goal_attribution
+            && let Ok(context) = attribution.lock()
+        {
+            stamp_goal_node(&mut payload, context.active_node());
+        }
         let pending = PendingEvent::new(self.session_id.clone(), Delivery::Lossless, payload);
         // Mirror every event into the trace as soon as it's generated so that
         // long-running turns (many tool-call iterations under a single
@@ -2343,6 +2756,7 @@ fn tool_runtime_event_payload(
                 call_id: call_id.clone(),
                 tool_name: tool_name.into(),
                 chunk,
+                goal_node: None,
             })
         }
         ToolRuntimeEvent::Started { .. } | ToolRuntimeEvent::Completed { .. } => None,
@@ -2437,6 +2851,7 @@ pub(crate) async fn materialize_assistant_message(
                 }
                 delta_events.push(SessionEventPayload::DeltaItem {
                     delta: halter_protocol::DeltaItem { text: delta },
+                    goal_node: None,
                 });
             }
             Ok(StreamEvent::TextEnd { .. }) => {
@@ -3255,6 +3670,8 @@ impl Default for RuntimeServices {
             subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
             trace_recorder: None,
+            goal_tracking: GoalAttributionMode::Off,
+            goal_store: None,
         }
     }
 }
@@ -3390,6 +3807,7 @@ mod tests {
             Delivery::Lossless,
             SessionEventPayload::Warning {
                 message: "post-drop".to_owned(),
+                goal_node: None,
             },
         );
         recorder.record(&pending.into_committed(1));
@@ -3402,6 +3820,273 @@ mod tests {
             contents.contains("post-drop"),
             "trace did not capture post-drop event:\n{contents}"
         );
+    }
+
+    /// Task 6.1: with no attribution context installed (goal tracking off, the
+    /// default), the chokepoint stamps nothing — turn-attributable payloads are
+    /// emitted with `goal_node = None` exactly as today (Requirements 2.1, 2.4).
+    #[test]
+    fn chokepoint_off_mode_leaves_goal_node_none() {
+        let services = Arc::new(RuntimeServices::default());
+        let session_id = SessionId::from("choke-off");
+        let handle = HalterSession::new(services, session_id).expect("handle");
+
+        let event = handle.make_event(SessionEventPayload::MessageItem {
+            message: Message::User(halter_protocol::UserMessage::text("hi")),
+            goal_node: None,
+        });
+        match event.payload {
+            SessionEventPayload::MessageItem { goal_node, .. } => assert_eq!(goal_node, None),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// Task 6.1: with an `auto` attribution context whose active node is set,
+    /// the chokepoint stamps `goal_node = active` onto turn-attributable
+    /// payloads while leaving non-attributable markers untouched (Requirements
+    /// 3.1, 3.3).
+    #[test]
+    fn chokepoint_auto_mode_stamps_active_node() {
+        let services = Arc::new(RuntimeServices::default());
+        let session_id = SessionId::from("choke-auto");
+        let mut handle = HalterSession::new(services, session_id).expect("handle");
+
+        let active = GoalNodeId::from("goal-7");
+        handle.install_goal_attribution(GoalAttributionMode::Auto, Some(active.clone()));
+
+        // Turn-attributable payload is stamped with the active node.
+        let tagged = handle.make_event(SessionEventPayload::TurnCompleted {
+            turn_id: TurnId::from("turn-1"),
+            usage: Usage::default(),
+            goal_node: None,
+        });
+        match tagged.payload {
+            SessionEventPayload::TurnCompleted { goal_node, .. } => {
+                assert_eq!(goal_node, Some(active.clone()));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        // Non-attributable marker is never stamped.
+        let marker = handle.make_event(SessionEventPayload::SessionStarted);
+        assert_eq!(marker.payload, SessionEventPayload::SessionStarted);
+    }
+
+    /// Task 6.1: an `auto` context whose root does not yet exist (`active =
+    /// None`) leaves `goal_node = None`, matching the graceful-degradation
+    /// shape task 6.2 builds on. Updating the active node via `set_active`
+    /// then makes the chokepoint stamp it.
+    #[test]
+    fn chokepoint_auto_without_root_is_noop_then_stamps_after_set_active() {
+        let services = Arc::new(RuntimeServices::default());
+        let session_id = SessionId::from("choke-auto-lazy");
+        let mut handle = HalterSession::new(services, session_id).expect("handle");
+
+        let context = handle.install_goal_attribution(GoalAttributionMode::Auto, None);
+
+        let before = handle.make_event(SessionEventPayload::Warning {
+            message: "w".to_owned(),
+            goal_node: None,
+        });
+        match before.payload {
+            SessionEventPayload::Warning { goal_node, .. } => assert_eq!(goal_node, None),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let active = GoalNodeId::from("root-1");
+        context.lock().expect("lock").set_active(Some(active.clone()));
+
+        let after = handle.make_event(SessionEventPayload::Warning {
+            message: "w".to_owned(),
+            goal_node: None,
+        });
+        match after.payload {
+            SessionEventPayload::Warning { goal_node, .. } => {
+                assert_eq!(goal_node, Some(active));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    // --- Task 6.2: lazy root + graceful degradation -----------------------
+
+    use halter_goals::{
+        EventLogGoalStore, GoalNodeId as GoalsGoalNodeId, GoalStore as GoalsGoalStore,
+        GoalStoreError, InMemoryGoalEventLog, IntentSignature,
+    };
+
+    /// A `GoalStore` whose `create` always fails, to exercise the
+    /// `ensure_root` failure / graceful-degradation path (Requirement 10.2).
+    #[derive(Debug)]
+    struct FailingGoalStore;
+
+    #[async_trait::async_trait]
+    impl GoalsGoalStore for FailingGoalStore {
+        async fn create(
+            &self,
+            _session: &SessionId,
+            _parent: Option<GoalsGoalNodeId>,
+            _hypothesis: String,
+            _intent: IntentSignature,
+        ) -> Result<GoalsGoalNodeId, GoalStoreError> {
+            Err(GoalStoreError::Log("store offline".to_owned()))
+        }
+
+        async fn revise(
+            &self,
+            _session: &SessionId,
+            _id: &GoalsGoalNodeId,
+            _revision: halter_goals::GoalNodeRevision,
+        ) -> Result<(), GoalStoreError> {
+            Err(GoalStoreError::Log("store offline".to_owned()))
+        }
+
+        async fn close(
+            &self,
+            _session: &SessionId,
+            _id: &GoalsGoalNodeId,
+            _resolution: halter_goals::Resolution,
+        ) -> Result<halter_goals::ClosureOutcome, GoalStoreError> {
+            Err(GoalStoreError::Log("store offline".to_owned()))
+        }
+
+        async fn get(
+            &self,
+            _session: &SessionId,
+            _id: &GoalsGoalNodeId,
+        ) -> Result<Option<halter_goals::GoalNode>, GoalStoreError> {
+            Err(GoalStoreError::Log("store offline".to_owned()))
+        }
+
+        async fn get_tree(
+            &self,
+            _session: &SessionId,
+        ) -> Result<halter_goals::GoalTree, GoalStoreError> {
+            Err(GoalStoreError::Log("store offline".to_owned()))
+        }
+    }
+
+    /// Task 6.2: in `auto`, `ensure_goal_root` lazily creates the root on first
+    /// call, after which the chokepoint stamps `active()` (always `Some`) onto
+    /// turn-attributable payloads (Requirements 4.1, 4.2).
+    #[tokio::test]
+    async fn ensure_goal_root_creates_root_then_chokepoint_stamps_it() {
+        let services = Arc::new(RuntimeServices::default());
+        let session_id = SessionId::from("choke-lazy-root");
+        let mut handle = HalterSession::new(services, session_id).expect("handle");
+
+        let store: Arc<dyn GoalsGoalStore> =
+            Arc::new(EventLogGoalStore::new(InMemoryGoalEventLog::new()));
+        let context = handle.install_goal_attribution_with_store(
+            GoalAttributionMode::Auto,
+            ActiveGoalStack::new(),
+            store,
+        );
+
+        // Before ensure_root: active is None, so stamping is a no-op.
+        assert_eq!(context.lock().expect("lock").active, None);
+        let before = handle.make_event(SessionEventPayload::Warning {
+            message: "w".to_owned(),
+            goal_node: None,
+        });
+        assert!(matches!(
+            before.payload,
+            SessionEventPayload::Warning { goal_node: None, .. }
+        ));
+
+        // Lazily create the root at the async point.
+        let mut events = Vec::new();
+        handle.ensure_goal_root(&mut events).await;
+        assert!(events.is_empty(), "no Warning on success");
+
+        // After ensure_root: active is Some and stays Some.
+        let root = context
+            .lock()
+            .expect("lock")
+            .active
+            .clone()
+            .expect("root created");
+
+        // Idempotent: a second call does not change the root or emit a warning.
+        let mut events2 = Vec::new();
+        handle.ensure_goal_root(&mut events2).await;
+        assert!(events2.is_empty());
+        assert_eq!(context.lock().expect("lock").active, Some(root.clone()));
+
+        // The sync chokepoint now stamps the root onto turn-attributable events.
+        let after = handle.make_event(SessionEventPayload::Warning {
+            message: "w".to_owned(),
+            goal_node: None,
+        });
+        match after.payload {
+            SessionEventPayload::Warning { goal_node, .. } => {
+                assert_eq!(goal_node, Some(root));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// Task 6.2: when `ensure_root` fails, `ensure_goal_root` emits a `Warning`,
+    /// leaves `active = None` (so events degrade to `goal_node = None`), and does
+    /// not fail the turn (Requirement 10.2).
+    #[tokio::test]
+    async fn ensure_goal_root_degrades_gracefully_on_failure() {
+        let services = Arc::new(RuntimeServices::default());
+        let session_id = SessionId::from("choke-root-fail");
+        let mut handle = HalterSession::new(services, session_id).expect("handle");
+
+        let store: Arc<dyn GoalsGoalStore> = Arc::new(FailingGoalStore);
+        let context = handle.install_goal_attribution_with_store(
+            GoalAttributionMode::Auto,
+            ActiveGoalStack::new(),
+            store,
+        );
+
+        let mut events = Vec::new();
+        handle.ensure_goal_root(&mut events).await;
+
+        // A Warning is emitted (never a failure), and it is not itself tagged.
+        assert_eq!(events.len(), 1, "exactly one Warning on failure");
+        match &events[0].payload {
+            SessionEventPayload::Warning { message, goal_node } => {
+                assert!(message.contains("root goal"));
+                assert_eq!(*goal_node, None);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        // Attribution degrades: active stays None, so events keep goal_node = None.
+        assert_eq!(context.lock().expect("lock").active, None);
+        let after = handle.make_event(SessionEventPayload::Warning {
+            message: "w".to_owned(),
+            goal_node: None,
+        });
+        assert!(matches!(
+            after.payload,
+            SessionEventPayload::Warning { goal_node: None, .. }
+        ));
+    }
+
+    /// Task 6.2: in `off` mode `ensure_goal_root` is a no-op — no store call, no
+    /// Warning, no stamping (Requirements 1.4, 2.4).
+    #[tokio::test]
+    async fn ensure_goal_root_is_noop_when_off() {
+        let services = Arc::new(RuntimeServices::default());
+        let session_id = SessionId::from("choke-root-off");
+        let mut handle = HalterSession::new(services, session_id).expect("handle");
+
+        // Even if a (failing) store is supplied, off mode ignores it.
+        let store: Arc<dyn GoalsGoalStore> = Arc::new(FailingGoalStore);
+        let context = handle.install_goal_attribution_with_store(
+            GoalAttributionMode::Off,
+            ActiveGoalStack::new(),
+            store,
+        );
+
+        let mut events = Vec::new();
+        handle.ensure_goal_root(&mut events).await;
+        assert!(events.is_empty(), "off mode emits no Warning");
+        assert_eq!(context.lock().expect("lock").active, None);
     }
 
     /// Regression: a provider stream that ends without `ToolCallEnd` for an
@@ -3850,6 +4535,7 @@ mod tests {
                     Delivery::Lossless,
                     SessionEventPayload::MessageItem {
                         message: Message::User(UserMessage::text("tail message")),
+                        goal_node: None,
                     },
                 )],
             )
@@ -3913,6 +4599,7 @@ mod tests {
                 Delivery::Lossless,
                 SessionEventPayload::Warning {
                     message: format!("event-{sequence}"),
+                    goal_node: None,
                 },
             )
             .into_committed(sequence)
@@ -4077,6 +4764,114 @@ mod tests {
             .await
             .expect("resume missing session");
         assert!(missing.is_none());
+    }
+
+    /// Task 9.2 / Requirement 6.5: resuming an `auto`-mode session rehydrates
+    /// the active-goal stack from the session's persisted `Goal` events, so
+    /// attribution resumes at a real previously-persisted node rather than a
+    /// freshly-created duplicate root.
+    ///
+    /// The session's goal tree is advanced before resume (a root plus a
+    /// subgoal), and after resume the chokepoint's active node is the persisted
+    /// root — the root-fallback reconstruction the design permits, since the
+    /// active-node pointer is not itself a persisted field. Crucially, resume
+    /// creates no second root: the folded tree keeps exactly the nodes committed
+    /// before resume.
+    #[tokio::test]
+    async fn resume_rehydrates_active_goal_stack_from_persisted_goal_events() {
+        use halter_goals::{EventLogGoalStore, IntentSignature, SessionStoreGoalEventLog};
+
+        fn goal_intent() -> IntentSignature {
+            IntentSignature {
+                intent_type: "session".into(),
+                target_type: "session".into(),
+                target_ref: "root".into(),
+                scope: "session".into(),
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        // Enable auto goal tracking with a goal store sharing the SAME session
+        // store, so goal events persist on the one session log and can be
+        // re-folded on resume.
+        let goal_store: Arc<dyn halter_goals::GoalStore> = Arc::new(EventLogGoalStore::new(
+            SessionStoreGoalEventLog::new(services.sessions.clone()),
+        ));
+        {
+            let services = Arc::get_mut(&mut services).expect("unique services");
+            services.goal_tracking = GoalAttributionMode::Auto;
+            services.goal_store = Some(goal_store.clone());
+        }
+
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let session_id = session.session_id().clone();
+
+        // Advance the goal tree: create the root, then a subgoal so the tree has
+        // more than just the root (active != root at the time work happened).
+        let root = goal_store
+            .create(
+                &session_id,
+                None,
+                "session root".to_owned(),
+                goal_intent(),
+            )
+            .await
+            .expect("create root");
+        let subgoal = goal_store
+            .create(
+                &session_id,
+                Some(root.clone()),
+                "investigate a subgoal".to_owned(),
+                goal_intent(),
+            )
+            .await
+            .expect("create subgoal");
+
+        let tree_before = goal_store.get_tree(&session_id).await.expect("tree before");
+        assert_eq!(tree_before.len(), 2, "root + subgoal persisted");
+        assert_eq!(tree_before.root(), Some(&root));
+
+        // Resume: the handle must rehydrate its active-goal stack from the folded
+        // goal events rather than starting empty.
+        let resumed = runtime
+            .resume(&session_id)
+            .await
+            .expect("resume")
+            .expect("session exists");
+
+        // Attribution resumes at the persisted root (root-fallback: the
+        // previously-active subgoal pointer is not itself persisted, so the
+        // reconstruction resumes at the persisted tree root — not a new one).
+        assert_eq!(
+            resumed.goal_active_node(),
+            Some(root.clone()),
+            "resumed session must attribute to the persisted root, not an empty/new root"
+        );
+
+        // Resume created no second root: the folded tree is unchanged.
+        let tree_after = goal_store.get_tree(&session_id).await.expect("tree after");
+        assert_eq!(
+            tree_after.len(),
+            2,
+            "resume must not create a duplicate root goal"
+        );
+        assert_eq!(tree_after.root(), Some(&root));
+        assert!(tree_after.contains(&subgoal));
+
+        // The resumed chokepoint stamps the rehydrated root onto turn events.
+        let tagged = resumed.make_event(SessionEventPayload::TurnCompleted {
+            turn_id: TurnId::from("turn-resumed"),
+            usage: Usage::default(),
+            goal_node: None,
+        });
+        match tagged.payload {
+            SessionEventPayload::TurnCompleted { goal_node, .. } => {
+                assert_eq!(goal_node, Some(root));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     /// The log/checkpoint invariant end-to-end: after real turns through the
@@ -4380,6 +5175,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::Assistant(assistant),
+                ..
             } if assistant.parts.iter().any(|part| matches!(
                 part,
                 AssistantPart::Text { text } if text.contains("tool completed")
@@ -4411,6 +5207,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::Assistant(assistant),
+                ..
             } if assistant.parts.iter().filter(|part| matches!(part, AssistantPart::ToolCall(_))).count() == 1
         )));
     }
@@ -4466,6 +5263,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::Tool(tool),
+                ..
             } if tool
                 .error
                 .as_ref()
@@ -4727,6 +5525,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::Tool(tool),
+                ..
             } if tool
                 .error
                 .as_ref()
@@ -4807,6 +5606,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::System(system),
+                ..
             } if system.text.contains("blocked by prompt hook")
         )));
     }
@@ -4871,18 +5671,21 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::System(system),
+                ..
             } if system.text.contains("function count 1")
         )));
         assert!(events_a2.iter().any(|event| matches!(
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::System(system),
+                ..
             } if system.text.contains("function count 2")
         )));
         assert!(events_b1.iter().any(|event| matches!(
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::System(system),
+                ..
             } if system.text.contains("function count 1")
         )));
     }
@@ -4913,7 +5716,7 @@ mod tests {
 
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::Warning { message } if message.contains("hook warning")
+            SessionEventPayload::Warning { message, .. } if message.contains("hook warning")
         )));
     }
 
@@ -5160,7 +5963,7 @@ mod tests {
         let final_reply = position(&|payload| {
             matches!(
                 payload,
-                SessionEventPayload::MessageItem { message: Message::Assistant(assistant) }
+                SessionEventPayload::MessageItem { message: Message::Assistant(assistant), .. }
                     if assistant.parts.iter().any(|part| matches!(
                         part,
                         AssistantPart::Text { text } if text.contains("tool completed")
@@ -5306,7 +6109,7 @@ mod tests {
 
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::Warning { message }
+            SessionEventPayload::Warning { message, .. }
                 if message.contains("blocked by a PreCompact hook")
                     && message.contains("not while the notes are open")
         )));
@@ -5343,7 +6146,7 @@ mod tests {
 
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::Warning { message }
+            SessionEventPayload::Warning { message, .. }
                 if message.contains("automatic compaction did not run")
                     && message.contains("compaction endpoint exploded")
         )));
@@ -5698,7 +6501,7 @@ mod tests {
             .filter(|event| {
                 matches!(
                     &event.payload,
-                    SessionEventPayload::MessageItem { message: Message::System(system) }
+                    SessionEventPayload::MessageItem { message: Message::System(system), .. }
                         if system.text.starts_with("milestone:")
                 )
             })
@@ -5798,6 +6601,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::System(system),
+                ..
             } if system.text == "Context is half full."
         )
     }
@@ -6390,7 +7194,7 @@ mod tests {
         let completed: Vec<String> = events
             .iter()
             .filter_map(|event| match &event.payload {
-                SessionEventPayload::ToolExecutionCompleted { outcome } => {
+                SessionEventPayload::ToolExecutionCompleted { outcome, .. } => {
                     Some(outcome.call.name.0.clone())
                 }
                 _ => None,
@@ -6402,7 +7206,7 @@ mod tests {
         // reached the transcript...
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::MessageItem { message: Message::Assistant(assistant) }
+            SessionEventPayload::MessageItem { message: Message::Assistant(assistant), .. }
                 if assistant.parts.iter().any(|part| matches!(
                     part,
                     AssistantPart::ToolCall(call) if call.name.0 == "write"
@@ -6570,7 +7374,7 @@ mod tests {
             .expect("collect events");
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::Warning { message }
+            SessionEventPayload::Warning { message, .. }
                 if message.contains("automatic compaction did not run")
                     && message.contains("returned no checkpoint summary")
         )));
@@ -6583,7 +7387,7 @@ mod tests {
         // restore that ended the pass follows it.
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::MessageItem { message: Message::User(user) }
+            SessionEventPayload::MessageItem { message: Message::User(user), .. }
                 if user.plain_text().starts_with(crate::default_compaction_prompt())
         )));
         assert!(events.iter().any(|event| matches!(
@@ -6675,7 +7479,7 @@ mod tests {
 
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::Warning { message }
+            SessionEventPayload::Warning { message, .. }
                 if message.contains("checkpoint inference failed")
         )));
         assert!(
@@ -6695,7 +7499,7 @@ mod tests {
             assert!(
                 events.iter().any(|event| matches!(
                     &event.payload,
-                    SessionEventPayload::MessageItem { message: Message::User(user) }
+                    SessionEventPayload::MessageItem { message: Message::User(user), .. }
                         if user.plain_text().starts_with(&expected)
                 )),
                 "the log keeps the pass's request starting {:?}",
@@ -6915,7 +7719,7 @@ mod tests {
                     1,
                     "{mode}"
                 );
-                assert!(!events.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionStarted { call } if call.name.0 == "write")));
+                assert!(!events.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionStarted { call, .. } if call.name.0 == "write")));
                 assert!(!temp.path().join("must-not-exist").exists());
                 let requests = provider.requests.lock().unwrap().clone();
                 let bootstrap = requests
@@ -6991,7 +7795,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(windows["items"].as_array().unwrap().len(), 2);
-                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(ToolResult::Json { value }) if value["items"].as_array().unwrap().len() == 2))));
+                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome, .. } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(ToolResult::Json { value }) if value["items"].as_array().unwrap().len() == 2))));
                 let resumed = runtime.resume(session.session_id()).await.unwrap().unwrap();
                 assert!(
                     search
@@ -7038,7 +7842,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(events.iter().any(|event| matches!(
-                &event.payload, SessionEventPayload::MessageItem { message: Message::Tool(result) }
+                &event.payload, SessionEventPayload::MessageItem { message: Message::Tool(result), .. }
                     if result.error.is_some()
             )));
             assert!(!events.iter().any(|event| matches!(
@@ -7287,7 +8091,7 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
-            assert!(events.iter().any(|event| matches!(&event.payload, SessionEventPayload::Warning { message } if message.contains("exceeds context.max_tokens"))));
+            assert!(events.iter().any(|event| matches!(&event.payload, SessionEventPayload::Warning { message, .. } if message.contains("exceeds context.max_tokens"))));
             assert!(
                 events.iter().any(|event| matches!(
                     event.payload,
@@ -7484,6 +8288,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::User(user),
+                ..
             } if user.plain_text() == "will fail"
         )));
     }
@@ -7597,6 +8402,7 @@ mod tests {
             &event.payload,
             SessionEventPayload::MessageItem {
                 message: Message::Assistant(assistant),
+                ..
             } if assistant.parts.iter().any(|part| matches!(
                 part,
                 AssistantPart::Text { text } if text.contains("subagent provider reply")
@@ -7680,7 +8486,7 @@ mod tests {
         assert_eq!(written, "hello from tool");
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::ToolExecutionCompleted { outcome }
+            SessionEventPayload::ToolExecutionCompleted { outcome, .. }
                 if outcome.call.name.0 == "write" && outcome.result.is_ok()
         )));
         assert!(events.iter().any(|event| matches!(
@@ -7692,7 +8498,7 @@ mod tests {
         let replayed = session.replay().await.expect("replay events");
         assert!(replayed.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::ToolExecutionCompleted { outcome }
+            SessionEventPayload::ToolExecutionCompleted { outcome, .. }
                 if outcome.call.name.0 == "write" && outcome.result.is_ok()
         )));
         assert!(replayed.iter().any(|event| matches!(
@@ -8020,7 +8826,7 @@ mod tests {
     fn event_has_delta_text(event: &SessionEvent, needle: &str) -> bool {
         matches!(
             &event.payload,
-            SessionEventPayload::DeltaItem { delta } if delta.text.contains(needle)
+            SessionEventPayload::DeltaItem { delta, .. } if delta.text.contains(needle)
         )
     }
 

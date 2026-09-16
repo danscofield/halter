@@ -387,6 +387,160 @@ impl GoalEventLog for InMemoryGoalEventLog {
     }
 }
 
+// --- SessionStoreGoalEventLog ----------------------------------------------
+
+use halter_protocol::{Delivery, PendingEvent, SessionEvent, SessionEventPayload};
+use halter_session::{SessionCommitConflict, SessionStore};
+
+/// A [`GoalEventLog`] backed by the event-sourced
+/// [`SessionStore`](halter_session::SessionStore) — the adapter the module docs
+/// anticipated (design § "Component 4: `SessionStore`-backed `GoalEventLog`
+/// adapter", Requirements 8.1, 8.2, 8.5).
+///
+/// Goal mutations ride the **same** gap-free, sequence-ordered session log as
+/// tagged transcript events: each [`GoalEvent`] is wrapped as a
+/// [`SessionEventPayload::Goal`] and committed through the single
+/// [`SessionStore::commit`](halter_session::SessionStore::commit) path, so goal
+/// and transcript events share one monotonic sequence space
+/// (Requirement 8.1, 8.2). This makes "the tagged events between goal sequences
+/// *a* and *b*" a coherent, well-defined statement for the compaction consumer.
+///
+/// The [`GoalEventLog`] contract is preserved exactly, so
+/// [`EventLogGoalStore`] and every Tier that folds goal events are unchanged —
+/// only the backing log swaps:
+///
+/// - [`append`](GoalEventLog::append) assigns gap-free monotonic sequences
+///   starting at the shared log head + 1 (the session store assigns them);
+/// - [`replay`](GoalEventLog::replay) returns only the session's `Goal`
+///   payloads, in ascending sequence order (Requirement 8.2);
+/// - an append whose `expected_head_sequence` does not match the shared head is
+///   rejected as [`GoalStoreError::Conflict`], appending nothing and leaving the
+///   log and folded tree unchanged (Requirement 8.5).
+///
+/// **Shared head.** [`head_sequence`](GoalEventLog::head_sequence) is the head
+/// of the *shared* session log (goal + transcript events), not a goal-only
+/// counter, because both kinds of event advance the same sequence.
+pub struct SessionStoreGoalEventLog {
+    sessions: Arc<dyn SessionStore>,
+}
+
+impl std::fmt::Debug for SessionStoreGoalEventLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionStoreGoalEventLog")
+            .field("sessions", &"<dyn SessionStore>")
+            .finish()
+    }
+}
+
+impl SessionStoreGoalEventLog {
+    /// Wrap a shared [`SessionStore`](halter_session::SessionStore) as a
+    /// [`GoalEventLog`] so goal events ride the same session log as transcript
+    /// events.
+    #[must_use]
+    pub fn new(sessions: Arc<dyn SessionStore>) -> Self {
+        Self { sessions }
+    }
+
+    /// The head sequence of the shared session log — the highest committed
+    /// sequence across goal *and* transcript events, or `0` when the log is
+    /// empty.
+    async fn shared_head(&self, session: &SessionId) -> Result<u64, GoalStoreError> {
+        let events = self
+            .sessions
+            .replay(session)
+            .await
+            .map_err(|err| GoalStoreError::Log(err.to_string()))?;
+        Ok(events.last().map_or(0, SessionEvent::sequence))
+    }
+}
+
+#[async_trait]
+impl GoalEventLog for SessionStoreGoalEventLog {
+    async fn append(
+        &self,
+        session: &SessionId,
+        events: Vec<GoalEvent>,
+        expected_head_sequence: Option<u64>,
+    ) -> Result<Vec<SequencedGoalEvent>, GoalStoreError> {
+        // Wrap each GoalEvent as a Goal payload and commit through the single
+        // SessionStore::commit path, passing the caller's expected head straight
+        // through for OCC. The store assigns gap-free monotonic sequences shared
+        // with transcript events (Requirements 8.1, 8.2).
+        let pending: Vec<PendingEvent> = events
+            .into_iter()
+            .map(|event| {
+                PendingEvent::new(
+                    session.clone(),
+                    Delivery::Lossless,
+                    SessionEventPayload::Goal { event },
+                )
+            })
+            .collect();
+
+        let committed = self
+            .sessions
+            .commit(session, None, expected_head_sequence, None, pending)
+            .await
+            .map_err(|err| {
+                // A stale expected head loses the race: surface it as the
+                // contract's Conflict, appending nothing (Requirement 8.5).
+                match err.downcast::<SessionCommitConflict>() {
+                    Ok(conflict) => GoalStoreError::Conflict {
+                        expected: conflict.expected_head_sequence,
+                        actual: conflict.actual_head_sequence,
+                    },
+                    Err(other) => GoalStoreError::Log(other.to_string()),
+                }
+            })?;
+
+        // Map the committed session events back to sequenced goal events. Every
+        // event we committed is a Goal payload, so the projection is total and
+        // preserves the store-assigned ascending sequence order.
+        committed
+            .into_iter()
+            .map(|event| {
+                let sequence = event.sequence();
+                match event.payload {
+                    SessionEventPayload::Goal { event } => Ok((sequence, event)),
+                    // The store echoes back exactly what we committed; anything
+                    // else is a backend contract violation.
+                    _ => Err(GoalStoreError::Log(
+                        "session store returned a non-goal payload for a goal commit".to_owned(),
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    async fn replay(
+        &self,
+        session: &SessionId,
+    ) -> Result<Vec<SequencedGoalEvent>, GoalStoreError> {
+        // Replay the shared session log and keep only Goal payloads, preserving
+        // the ascending sequence order the store returns (Requirement 8.2).
+        let events = self
+            .sessions
+            .replay(session)
+            .await
+            .map_err(|err| GoalStoreError::Log(err.to_string()))?;
+        Ok(events
+            .into_iter()
+            .filter_map(|event| {
+                let sequence = event.sequence();
+                match event.payload {
+                    SessionEventPayload::Goal { event } => Some((sequence, event)),
+                    _ => None,
+                }
+            })
+            .collect())
+    }
+
+    async fn head_sequence(&self, session: &SessionId) -> Result<u64, GoalStoreError> {
+        // The shared session log's head; goal and transcript events share it.
+        self.shared_head(session).await
+    }
+}
+
 // --- EventLogGoalStore -----------------------------------------------------
 
 /// A concrete [`GoalStore`] over any [`GoalEventLog`].
@@ -1290,5 +1444,203 @@ mod tests {
         assert_eq!(tree.len(), 2);
         assert_eq!(tree.root(), Some(&root));
         assert_eq!(tree.children(&root), &[child]);
+    }
+
+    // --- SessionStoreGoalEventLog conformance (task 3.1) ------------------
+    //
+    // The adapter must honor the identical GoalEventLog contract the in-memory
+    // log does — gap-free monotonic sequences, in-order replay, and OCC
+    // conflict on expected_head_sequence mismatch leaving the log unchanged —
+    // now over the shared SessionStore log (Requirements 8.1, 8.2, 8.5).
+
+    use halter_protocol::{
+        Delivery, ModelId, PendingEvent, ResourceSnapshot, SessionBlueprint, SessionEventPayload,
+        SessionState, SubagentEventForwarding,
+    };
+    use halter_session::{InMemorySessionStore, SessionStore, StoredSession};
+
+    /// A SessionStore-backed adapter over a freshly created session, returning
+    /// both the adapter and the shared store so tests can commit transcript
+    /// events alongside goal events.
+    async fn adapter_and_store(
+        session: &SessionId,
+    ) -> (SessionStoreGoalEventLog, Arc<InMemorySessionStore>) {
+        let store = Arc::new(InMemorySessionStore::default());
+        let snapshot = Arc::new(ResourceSnapshot::empty());
+        let blueprint = SessionBlueprint {
+            session_id: session.clone(),
+            parent_session_id: None,
+            default_model: ModelId::from("default"),
+            subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
+            snapshot_revision: snapshot.revision.clone(),
+            working_dir: std::path::PathBuf::from("."),
+            system_prompt_seed: Vec::new(),
+            max_turns: None,
+            subagent_depth: 0,
+        };
+        store
+            .create_session(StoredSession::new(
+                blueprint,
+                SessionState::default(),
+                snapshot,
+            ))
+            .await
+            .expect("create session");
+        let adapter = SessionStoreGoalEventLog::new(store.clone());
+        (adapter, store)
+    }
+
+    #[tokio::test]
+    async fn adapter_append_assigns_gap_free_monotonic_sequences() {
+        let s = session("s1");
+        let (log, _store) = adapter_and_store(&s).await;
+
+        // First append of two events -> sequences 1, 2.
+        let first = log
+            .append(&s, vec![created("a", None), created("b", Some("a"))], None)
+            .await
+            .expect("first append succeeds");
+        assert_eq!(first.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![1, 2]);
+
+        // Second append of one event -> sequence 3 (exactly head + 1, no gap).
+        let second = log
+            .append(&s, vec![created("c", Some("a"))], Some(2))
+            .await
+            .expect("second append succeeds");
+        assert_eq!(second.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![3]);
+
+        assert_eq!(log.head_sequence(&s).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn adapter_replay_returns_goal_events_in_sequence_order() {
+        let s = session("s1");
+        let (log, _store) = adapter_and_store(&s).await;
+        log.append(&s, vec![created("a", None)], None).await.unwrap();
+        log.append(&s, vec![created("b", Some("a"))], Some(1)).await.unwrap();
+        log.append(&s, vec![created("c", Some("a"))], Some(2)).await.unwrap();
+
+        let replayed = log.replay(&s).await.expect("replay succeeds");
+        assert_eq!(
+            replayed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let ids: Vec<GoalNodeId> = replayed
+            .iter()
+            .map(|(_, event)| match event {
+                GoalEvent::GoalNodeCreated { id, .. } => id.clone(),
+                _ => panic!("unexpected event variant"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![GoalNodeId::from("a"), GoalNodeId::from("b"), GoalNodeId::from("c")]
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_expected_head_mismatch_rejects_and_leaves_log_unchanged() {
+        let s = session("s1");
+        let (log, _store) = adapter_and_store(&s).await;
+        log.append(&s, vec![created("a", None)], None).await.unwrap();
+        log.append(&s, vec![created("b", Some("a"))], Some(1)).await.unwrap();
+
+        let before = log.replay(&s).await.unwrap();
+        assert_eq!(log.head_sequence(&s).await.unwrap(), 2);
+
+        // Append expecting a stale head (1) while the real head is 2: rejected.
+        let err = log
+            .append(&s, vec![created("c", Some("a"))], Some(1))
+            .await
+            .expect_err("stale expected head must reject");
+        match err {
+            GoalStoreError::Conflict { expected, actual } => {
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 2);
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // The log is unchanged: same events, same head (Requirement 8.5).
+        let after = log.replay(&s).await.unwrap();
+        assert_eq!(before, after, "rejected append must leave the log unchanged");
+        assert_eq!(log.head_sequence(&s).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn adapter_shares_sequence_space_with_transcript_events() {
+        // Goal and transcript events ride the SAME gap-free sequence space
+        // (Requirements 8.1, 8.2): a transcript commit between goal appends
+        // advances the shared head, and replay filters back only goal events
+        // while preserving their store-assigned sequences.
+        let s = session("s1");
+        let (log, store) = adapter_and_store(&s).await;
+
+        // seq 1: a goal event.
+        let g1 = log.append(&s, vec![created("a", None)], None).await.unwrap();
+        assert_eq!(g1.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![1]);
+
+        // seq 2: a transcript (non-goal) event committed directly on the store.
+        store
+            .commit(
+                &s,
+                None,
+                Some(1),
+                None,
+                vec![PendingEvent::new(
+                    s.clone(),
+                    Delivery::Lossless,
+                    SessionEventPayload::Warning {
+                        message: "hi".to_owned(),
+                        goal_node: None,
+                    },
+                )],
+            )
+            .await
+            .expect("commit transcript event");
+
+        // The shared head is now 2, so the next goal append lands at seq 3.
+        assert_eq!(log.head_sequence(&s).await.unwrap(), 2);
+        let g2 = log.append(&s, vec![created("b", Some("a"))], Some(2)).await.unwrap();
+        assert_eq!(g2.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![3]);
+
+        // Replay returns only the two goal events, at their shared-log
+        // sequences 1 and 3 (the transcript event at seq 2 is filtered out).
+        let replayed = log.replay(&s).await.unwrap();
+        assert_eq!(
+            replayed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn event_log_goal_store_over_adapter_is_unchanged() {
+        // The GoalEventLog contract is identical, so EventLogGoalStore works
+        // unchanged over the SessionStore-backed adapter (design § Component 4).
+        let s = session("s1");
+        let (log, _store) = adapter_and_store(&s).await;
+        let goal_store = EventLogGoalStore::new(log);
+
+        let root = goal_store
+            .create(&s, None, "root".to_owned(), intent("root"))
+            .await
+            .expect("create root over adapter");
+        let child = goal_store
+            .create(&s, Some(root.clone()), "child".to_owned(), intent("child"))
+            .await
+            .expect("create child over adapter");
+
+        let tree = goal_store.get_tree(&s).await.unwrap();
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.root(), Some(&root));
+        assert_eq!(tree.children(&root), std::slice::from_ref(&child));
+
+        let outcome = goal_store
+            .close(&s, &child, Resolution::Accepted)
+            .await
+            .expect("close child over adapter");
+        assert!(outcome.closed);
+        assert!(outcome.subtree_hash.is_some());
     }
 }

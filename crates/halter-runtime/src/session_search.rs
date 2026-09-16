@@ -388,6 +388,7 @@ mod tests {
                     Delivery::Lossless,
                     SessionEventPayload::MessageItem {
                         message: Message::User(UserMessage::text("new request")),
+                        goal_node: None,
                     },
                 )],
             )
@@ -447,6 +448,7 @@ mod tests {
                         message: Message::User(UserMessage::text(format!(
                             "line one\n[special] request {i}\nlast"
                         ))),
+                        goal_node: None,
                     },
                 )
             })

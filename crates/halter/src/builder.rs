@@ -7,12 +7,14 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use halter_config::{
-    CompactionStrategyKind, ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig,
+    CompactionStrategyKind, ConfiguredProvider, DEFAULT_MODEL_ID, GoalTrackingMode, HarnessConfig,
+    ModelConfig,
     ModelJudgeConfig, ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig,
     PromptsConfig, ResilienceConfig, ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID,
     SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, ShellModeConfig, SystemPromptPreset,
     expand_path, load_path, resolve_provider_runtime_config,
 };
+use halter_goals::{EventLogGoalStore, GoalStore, SessionStoreGoalEventLog};
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
     HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderCapabilities, ProviderName,
@@ -26,13 +28,14 @@ use halter_providers::{
 };
 use halter_runtime::{
     CleanWindow, CompactionStrategy, ContextSettings, DefaultContextManager,
-    DefaultPromptAssembler, EventBus, HalterSession, ModelSummary, ProviderDefault, ResourceHandle,
-    RuntimeServices, SessionInit, SessionRuntime, StoreSearch, TraceRecorder, WindowPolicy,
+    DefaultPromptAssembler, EventBus, GoalAttributionMode, HalterSession, ModelSummary,
+    ProviderDefault, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime, StoreSearch,
+    TraceRecorder, WindowPolicy,
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
-    DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, ShellMode, Tool, ToolRuntime,
-    ToolSessionStore, register_builtin_tools, register_subagent_tools,
+    DefaultToolPolicy, GoalTool, LoopbackAllow, PathLockMap, PolicySettings, ShellMode, Tool,
+    ToolRuntime, ToolSessionStore, register_builtin_tools, register_subagent_tools,
 };
 use tracing::{debug, info};
 
@@ -289,6 +292,25 @@ impl HalterBuilder {
             tools.register(tool);
         }
 
+        // Goal tracking wiring (task 9.1). When `[context].goal_tracking =
+        // auto`, build the `SessionStore`-backed `GoalStore` over the shared
+        // session store, register the `GoalTool` over that same store, and
+        // record the auto mode + store on `RuntimeServices` so each new
+        // `SessionHandle` installs the auto-mode attribution context and the
+        // per-session `ActiveGoalStack` (created lazily on first use). When
+        // `off`, register no goal tool, leave the Goal Model dormant, and stamp
+        // no tag — byte-identical to today.
+        let (goal_tracking, goal_store) = match resolved_context.goal_tracking {
+            GoalTrackingMode::Auto => {
+                let store: Arc<dyn GoalStore> = Arc::new(EventLogGoalStore::new(
+                    SessionStoreGoalEventLog::new(sessions.clone()),
+                ));
+                tools.register(Arc::new(GoalTool::new(store.clone())));
+                (GoalAttributionMode::Auto, Some(store))
+            }
+            GoalTrackingMode::Off => (GoalAttributionMode::Off, None),
+        };
+
         let policy = Arc::new(DefaultToolPolicy::new(policy_from_config(&config.policy)));
         let trace_recorder = config
             .runtime
@@ -317,6 +339,8 @@ impl HalterBuilder {
             subagent_event_forwarding_cap: config.runtime.subagent_event_forwarding_cap,
             shell_timeout_secs: config.policy.shell.timeout_secs,
             trace_recorder,
+            goal_tracking,
+            goal_store,
         });
         let runtime = SessionRuntime::new(services.clone());
         register_subagent_tools(
@@ -2100,6 +2124,59 @@ mod tests {
                 .is_some_and(|segment| segment.text.contains("Compaction reminders apply.")),
             "strategy segments must follow the caller's seed: {:?}",
             blueprint.system_prompt_seed
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_registers_goal_tool_when_goal_tracking_auto() {
+        let mut config = openai_config(Some("test-key"));
+        config.context.goal_tracking = GoalTrackingMode::Auto;
+
+        let halter = HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build");
+
+        assert!(
+            halter.runtime().goal_tracking_enabled(),
+            "auto mode records goal tracking on the runtime services"
+        );
+        assert!(
+            halter
+                .runtime()
+                .tool_specs()
+                .iter()
+                .any(|spec| spec.name.0 == "goal"),
+            "auto mode registers the goal tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_registers_no_goal_tool_when_goal_tracking_off() {
+        // `off` is the default; assert it explicitly for clarity.
+        let mut config = openai_config(Some("test-key"));
+        config.context.goal_tracking = GoalTrackingMode::Off;
+
+        let halter = HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build");
+
+        assert!(
+            !halter.runtime().goal_tracking_enabled(),
+            "off mode leaves goal tracking dormant"
+        );
+        assert!(
+            halter
+                .runtime()
+                .tool_specs()
+                .iter()
+                .all(|spec| spec.name.0 != "goal"),
+            "off mode registers no goal tool"
         );
     }
 

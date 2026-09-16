@@ -34,6 +34,7 @@ globset.workspace = true
 grep-matcher.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
+halter-goals = { path = "../halter-goals", version = "0.5.0" }
 halter-protocol = { path = "../halter-protocol", version = "0.5.0" }
 ignore.workspace = true
 image = { workspace = true, optional = true }

@@ -314,7 +314,7 @@ async fn chat_body(session: &HalterSession, output: &mut dyn Write) -> anyhow::R
         let mut events = session.submit_turn(Turn::user(line)).await?;
         while let Some(event) = events.next().await {
             match event?.payload {
-                SessionEventPayload::DeltaItem { delta } => {
+                SessionEventPayload::DeltaItem { delta, .. } => {
                     write!(output, "{}", delta.text).context("failed to write output")?;
                     output.flush().context("failed to flush output")?;
                 }

@@ -895,6 +895,8 @@ async fn run_agent(
         subagent_event_forwarding_cap: sess.services().subagent_event_forwarding_cap,
         shell_timeout_secs: sess.services().shell_timeout_secs,
         trace_recorder: sess.services().trace_recorder.clone(),
+        goal_tracking: sess.services().goal_tracking,
+        goal_store: sess.services().goal_store.clone(),
     });
     let model = resolve_agent_model(sess, config.model.as_deref())?;
     let working_dir = request

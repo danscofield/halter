@@ -100,6 +100,7 @@ pub fn extract_subagent_output(events: &[SessionEvent]) -> Option<String> {
     events.iter().rev().find_map(|event| match &event.payload {
         SessionEventPayload::MessageItem {
             message: Message::Assistant(message),
+            ..
         } => Some(render_assistant_output(message)),
         _ => None,
     })
@@ -480,6 +481,7 @@ mod tests {
                     usage: None,
                     replay_meta: halter_protocol::ReplayMeta::default(),
                 }),
+                goal_node: None,
             },
         )];
 

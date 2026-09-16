@@ -164,6 +164,7 @@ mod tests {
                         Delivery::Lossless,
                         SessionEventPayload::Warning {
                             message: format!("from-{id}"),
+                            goal_node: None,
                         },
                     ),
                 ],

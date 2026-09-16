@@ -8,6 +8,7 @@ pub mod common;
 pub mod edit;
 pub mod fs_lock;
 pub mod glob;
+pub mod goal;
 pub mod grep;
 #[cfg(feature = "image-tools")]
 pub mod image;
@@ -31,6 +32,7 @@ pub use ast::AstGrepTool;
 pub use browser::BrowserTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
+pub use goal::{GoalStack, GoalStackStore, GoalTool, InMemoryGoalStackStore};
 pub use grep::GrepTool;
 #[cfg(feature = "image-tools")]
 pub use image::ImageTool;

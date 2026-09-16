@@ -321,6 +321,8 @@ fn panel_services(
         subagent_event_forwarding_cap: parent.subagent_event_forwarding_cap,
         shell_timeout_secs: parent.shell_timeout_secs,
         trace_recorder: parent.trace_recorder.clone(),
+        goal_tracking: parent.goal_tracking,
+        goal_store: parent.goal_store.clone(),
     })
 }
 

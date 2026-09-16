@@ -315,6 +315,53 @@ mod tests {
     }
 
     #[test]
+    fn subtree_hash_is_keyed_only_on_the_semantic_contract() {
+        // Requirements 9.3, 9.4: subtree_hash is derived ONLY from the semantic
+        // contract (hypothesis, resolution_conditions, resolution, intent,
+        // normalized tool_calls, resolved children in canonical order) and NOT
+        // from the raw tagged transcript. Because the tagged transcript lives on
+        // the shared session log — never inside GoalNode — the guard here fixes
+        // the entire semantic contract and asserts the hash is unchanged.
+        //
+        // Two nodes with byte-for-byte identical contracts must hash equally.
+        // Any number of incidental turn events could have been tagged to either
+        // node on the shared log; none of that content is an input to the hash,
+        // so the hashes cannot differ.
+        let contract = node("root", None, Resolution::Accepted);
+
+        let a = contract.clone();
+        let tree_a = tree_with(vec![a]);
+        let h_a = subtree_hash(tree_a.node(&GoalNodeId::from("root")).unwrap(), &tree_a);
+
+        // An independently constructed node with the identical semantic
+        // contract — standing in for the "same goal work, different incidental
+        // tagged transcript" case — hashes identically.
+        let b = contract.clone();
+        let tree_b = tree_with(vec![b]);
+        let h_b = subtree_hash(tree_b.node(&GoalNodeId::from("root")).unwrap(), &tree_b);
+
+        assert_eq!(
+            h_a, h_b,
+            "subtree_hash must depend only on the semantic contract, so tagging \
+             incidental transcript to a node never perturbs it (9.3, 9.4)"
+        );
+
+        // Sanity anchor: the ONLY inputs that can change the hash are the
+        // semantic-contract fields. Perturbing a contract field changes it
+        // (guarding against a degenerate constant hash that would make the
+        // invariance above vacuous).
+        let mut curated = contract.clone();
+        curated.tool_calls = vec![tool_call("root"), tool_call("root/extra")];
+        let tree_c = tree_with(vec![curated]);
+        let h_c = subtree_hash(tree_c.node(&GoalNodeId::from("root")).unwrap(), &tree_c);
+        assert_ne!(
+            h_a, h_c,
+            "the curated tool_calls contract is a hash input; only it (not the \
+             tagged transcript) can move the hash"
+        );
+    }
+
+    #[test]
     fn field_boundaries_are_unambiguous() {
         // Two nodes whose concatenated field bytes would coincide without
         // length-prefixing must hash differently.

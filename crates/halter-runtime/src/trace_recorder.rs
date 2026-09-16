@@ -291,6 +291,7 @@ mod tests {
             Delivery::Lossless,
             SessionEventPayload::Warning {
                 message: text.to_owned(),
+                goal_node: None,
             },
         )
     }

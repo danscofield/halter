@@ -39,7 +39,7 @@ impl SessionHistory {
     pub fn extend(&mut self, events: &[SessionEvent]) {
         for event in events {
             let messages: &[Message] = match &event.payload {
-                SessionEventPayload::MessageItem { message } => std::slice::from_ref(message),
+                SessionEventPayload::MessageItem { message, .. } => std::slice::from_ref(message),
                 SessionEventPayload::ContextCompacted {
                     effects: Some(effects),
                     ..

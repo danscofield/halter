@@ -32,6 +32,6 @@ pub use intent::{
 pub use model::{GoalEvent, GoalNode, GoalNodeRevision, GoalTree, GoalTreeState, Resolution};
 pub use store::{
     ClosureOutcome, EventLogGoalStore, GoalEventLog, GoalStore, GoalStoreError,
-    InMemoryGoalEventLog, SequencedGoalEvent,
+    InMemoryGoalEventLog, SequencedGoalEvent, SessionStoreGoalEventLog,
 };
 pub use subtree_hash::subtree_hash;

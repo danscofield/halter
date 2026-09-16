@@ -2349,18 +2349,19 @@ async fn run_session_turn(
             SessionEventPayload::SessionStarted => {
                 info!(stage = label, "agent session started");
             }
-            SessionEventPayload::Warning { message } => {
+            SessionEventPayload::Warning { message, .. } => {
                 warn!(stage = label, warning = %message, "agent warning");
             }
             SessionEventPayload::TurnStarted { turn_id } => {
                 info!(stage = label, turn_id = %turn_id, "agent turn started");
             }
-            SessionEventPayload::DeltaItem { delta } => {
+            SessionEventPayload::DeltaItem { delta, .. } => {
                 debug!(stage = label, bytes = delta.text.len(), "assistant delta");
                 delta_text.push_str(&delta.text);
             }
             SessionEventPayload::MessageItem {
                 message: Message::Assistant(message),
+                ..
             } => {
                 latest_text = Some(
                     message
@@ -2373,7 +2374,7 @@ async fn run_session_turn(
                         .collect::<String>(),
                 );
             }
-            SessionEventPayload::ToolExecutionStarted { call } => {
+            SessionEventPayload::ToolExecutionStarted { call, .. } => {
                 info!(
                     stage = label,
                     tool = %call.name,
@@ -2386,6 +2387,7 @@ async fn run_session_turn(
                 call_id,
                 tool_name,
                 chunk,
+                ..
             } => {
                 debug!(
                     stage = label,
@@ -2417,7 +2419,7 @@ async fn run_session_turn(
                     "hook completed"
                 );
             }
-            SessionEventPayload::ToolExecutionCompleted { outcome } => {
+            SessionEventPayload::ToolExecutionCompleted { outcome, .. } => {
                 let tool = outcome.call.name;
                 let call_id = outcome.call.id;
                 match outcome.result {
@@ -2463,6 +2465,7 @@ async fn run_session_turn(
             SessionEventPayload::TurnCompleted {
                 turn_id,
                 usage: turn_usage,
+                ..
             } => {
                 usage = turn_usage;
                 info!(

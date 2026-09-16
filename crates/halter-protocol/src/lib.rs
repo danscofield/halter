@@ -23,7 +23,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod fold;
+pub mod goals;
 pub mod token_ledger;
+
+pub use goals::{
+    CanonicalJson, ContentRef, EventKey, EventSeq, EvidenceValue, GoalDuration, GoalEvent,
+    GoalNode, GoalNodeId, GoalNodeRevision, GoalTimestamp, GoalToolCall, GoalToolName, GoalTree,
+    GoalTreeState, IntentSignature, IntentType, MemoryId, OutcomeRef, Resolution, Scope, Sha256,
+    SourceDescriptor, SubtreeHash, TargetRef, TargetType, ValidityToken,
+};
 
 pub use token_ledger::{
     CharHeuristicEstimator, TokenEstimator, TokenLedger, estimate_compacted_prefix_tokens,
@@ -966,18 +974,32 @@ pub enum SessionEventPayload {
     SessionResumed,
     Warning {
         message: String,
+        /// The goal node that owned the turn when this warning was emitted.
+        /// `None` on legacy logs and when goal tracking is off, so existing
+        /// serialized logs deserialize unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     TurnStarted {
         turn_id: TurnId,
     },
     MessageItem {
         message: Message,
+        /// The goal node that owned the turn when this item was emitted.
+        /// `None` on legacy logs and when goal tracking is off, so existing
+        /// serialized logs deserialize unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     /// Updates the non-transcript portion of the context projection. Emitted
     /// when prompt segments or tool declarations change, including the first
     /// request after loading a legacy snapshot.
     ContextProjectionUpdated {
         request_tokens: u64,
+        /// The goal node that owned the turn when this projection update was
+        /// emitted. `None` on legacy logs and when goal tracking is off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     /// A compaction pass appended to the transcript and then failed or found
     /// nothing to compact. The window goes back to what it was; everything
@@ -988,6 +1010,10 @@ pub enum SessionEventPayload {
     },
     DeltaItem {
         delta: DeltaItem,
+        /// The goal node that owned the turn when this delta was emitted.
+        /// `None` on legacy logs and when goal tracking is off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     /// Provider-emitted out-of-band annotations, forwarded verbatim as JSON
     /// text. See [`StreamEvent::ProviderMetadata`].
@@ -996,11 +1022,19 @@ pub enum SessionEventPayload {
     },
     ToolExecutionStarted {
         call: ToolCall,
+        /// The goal node that owned the turn when this tool execution started.
+        /// `None` on legacy logs and when goal tracking is off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     ToolOutput {
         call_id: ToolCallId,
         tool_name: ToolName,
         chunk: SharedStr,
+        /// The goal node that owned the turn when this tool output was emitted.
+        /// `None` on legacy logs and when goal tracking is off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     HookStarted {
         run: HookRunSummary,
@@ -1010,6 +1044,10 @@ pub enum SessionEventPayload {
     },
     ToolExecutionCompleted {
         outcome: ToolExecutionOutcome,
+        /// The goal node that owned the turn when this tool execution
+        /// completed. `None` on legacy logs and when goal tracking is off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     ApprovalRequested {
         tool_name: ToolName,
@@ -1031,6 +1069,10 @@ pub enum SessionEventPayload {
     TurnCompleted {
         turn_id: TurnId,
         usage: Usage,
+        /// The goal node that owned the turn when it completed.
+        /// `None` on legacy logs and when goal tracking is off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_node: Option<GoalNodeId>,
     },
     TurnFailed {
         turn_id: TurnId,
@@ -1048,6 +1090,13 @@ pub enum SessionEventPayload {
         dropped_events: u64,
     },
     SessionShutdownComplete,
+    /// A goal-tree mutation, so goal events ride the same sequence-ordered
+    /// session log as tagged transcript events. Consumed by the goal fold in
+    /// `halter-goals`; a no-op for [`fold::apply_event`] with respect to
+    /// `SessionState.messages`.
+    Goal {
+        event: GoalEvent,
+    },
 }
 
 /// An event that has been committed to the session store and therefore has
@@ -2158,6 +2207,7 @@ mod tests {
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
                 },
+                goal_node: None,
             },
         );
         let encoded = serde_json::to_string(&event).expect("serialize event");

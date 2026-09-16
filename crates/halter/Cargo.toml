@@ -27,6 +27,7 @@ remote-plugins = ["halter-config/remote-plugins"]
 anyhow.workspace = true
 async-trait.workspace = true
 halter-config = { path = "../halter-config", version = "0.5.0" }
+halter-goals = { path = "../halter-goals", version = "0.5.0" }
 halter-hooks = { path = "../halter-hooks", version = "0.5.0" }
 halter-protocol = { path = "../halter-protocol", version = "0.5.0" }
 halter-providers = { path = "../halter-providers", version = "0.5.0" }

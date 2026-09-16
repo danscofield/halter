@@ -433,7 +433,7 @@ impl RuntimeSubagentControl {
                 events.push(PendingEvent::new(
                     parent_session_id.clone(),
                     halter_protocol::Delivery::Lossless,
-                    SessionEventPayload::MessageItem { message },
+                    SessionEventPayload::MessageItem { message, goal_node: None },
                 ));
             }
 
@@ -1223,6 +1223,8 @@ mod tests {
             subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
             trace_recorder: None,
+            goal_tracking: crate::GoalAttributionMode::Off,
+            goal_store: None,
         })
     }
 

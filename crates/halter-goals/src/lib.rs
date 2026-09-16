@@ -53,7 +53,8 @@ pub mod integration;
 pub use goal_model::{
     ClosureOutcome, ClosureSignal, EventLogGoalStore, GoalEvent, GoalEventLog, GoalNode,
     GoalNodeRevision, GoalStore, GoalStoreError, GoalTree, InMemoryGoalEventLog, InductionQueue,
-    NoopInductionQueue, RecordingInductionQueue, Resolution, SharedInductionQueue,
+    NoopInductionQueue, RecordingInductionQueue, Resolution, SessionStoreGoalEventLog,
+    SharedInductionQueue,
 };
 
 /// Tier 1 — the exact-match evidence cache, normalization, and token service.

@@ -54,6 +54,7 @@ impl JsonResultTracker {
         match payload {
             SessionEventPayload::MessageItem {
                 message: Message::Assistant(message),
+                ..
             } => {
                 self.final_result = Some(message.clone());
                 Ok(None)
@@ -72,7 +73,7 @@ impl JsonResultTracker {
 #[must_use]
 pub fn strip_signatures_from_session_event(event: &SessionEvent) -> SessionEvent {
     let mut event = event.clone();
-    if let SessionEventPayload::MessageItem { message } = &mut event.payload {
+    if let SessionEventPayload::MessageItem { message, .. } = &mut event.payload {
         strip_signatures_from_message(message);
     }
     event
@@ -154,6 +155,7 @@ mod tests {
             tracker
                 .observe(&SessionEventPayload::MessageItem {
                     message: Message::Assistant(tool_request),
+                    goal_node: None,
                 })
                 .expect("observe tool request")
                 .is_none()
@@ -170,6 +172,7 @@ mod tests {
                         error: None,
                         created_at: Utc::now(),
                     }),
+                    goal_node: None,
                 })
                 .expect("observe tool result")
                 .is_none()
@@ -178,6 +181,7 @@ mod tests {
             tracker
                 .observe(&SessionEventPayload::MessageItem {
                     message: Message::Assistant(final_result.clone()),
+                    goal_node: None,
                 })
                 .expect("observe final result")
                 .is_none()
@@ -187,6 +191,7 @@ mod tests {
             .observe(&SessionEventPayload::TurnCompleted {
                 turn_id: halter_protocol::TurnId::from("turn-1"),
                 usage: Usage::default(),
+                goal_node: None,
             })
             .expect("turn completed")
             .expect("assistant result");
@@ -215,6 +220,7 @@ mod tests {
             .observe(&SessionEventPayload::TurnCompleted {
                 turn_id: halter_protocol::TurnId::from("turn-1"),
                 usage: Usage::default(),
+                goal_node: None,
             })
             .expect_err("turn completion without assistant result should fail");
         assert_eq!(error, "failed to capture final assistant result");
@@ -285,6 +291,7 @@ mod tests {
                     usage: Some(Usage::default()),
                     replay_meta: ReplayMeta::default(),
                 }),
+                goal_node: None,
             },
         );
 
@@ -308,6 +315,7 @@ mod tests {
                         usage: Some(Usage::default()),
                         replay_meta: ReplayMeta::default(),
                     }),
+                    goal_node: None,
                 },
             )
         );
@@ -335,6 +343,7 @@ mod tests {
             match &self.payload {
                 SessionEventPayload::MessageItem {
                     message: Message::Assistant(message),
+                    ..
                 } => message.created_at,
                 _ => panic!("expected assistant message payload"),
             }
