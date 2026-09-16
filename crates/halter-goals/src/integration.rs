@@ -36,8 +36,8 @@ use crate::tier1::tokens::{self, SourceProvider};
 use crate::tier2::memory::EvidenceContractItem;
 use crate::tier2::store::MemoryStore;
 use crate::tier2::{
-    decide_replay, EvidenceValidator, InductionEngine, InductionOutcome, ModeBPolicy,
-    ReplayDecision, Retrieval, TokensHold,
+    decide_replay, EvidenceValidator, GoalSummary, InductionEngine, InductionOutcome, ModeBPolicy,
+    ReplayDecision, Retrieval, SummaryProvider, TokensHold,
 };
 use crate::types::{IntentSignature, SourceDescriptor, Timestamp, ValidityToken};
 
@@ -307,6 +307,63 @@ pub fn start_goal(
     GoalStart::Replay(decide_replay(&top.memory, validator, mode_b_policy, sig, now))
 }
 
+// ===========================================================================
+// Part 2 — additive hot-path wiring: start_goal + similar-goal summaries
+// ===========================================================================
+
+/// The hot-path outcome plus any similar-goal summaries. Additive over
+/// [`GoalStart`].
+///
+/// This wraps the *unchanged* [`GoalStart`] shape and attaches any
+/// [`GoalSummary`] values produced by the opt-in
+/// [`SummaryProvider`](crate::tier2::SummaryProvider). Because the `start`
+/// field is exactly the value [`start_goal`] would have returned, the replay
+/// decision is unaffected by summaries (Requirements 13.3, 14.1, 14.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalStartWithSummaries {
+    /// The existing replay decision (unchanged shape).
+    pub start: GoalStart,
+    /// Similar-goal summaries; empty when disabled, no candidates, or on failure.
+    pub summaries: Vec<GoalSummary>,
+}
+
+/// Like [`start_goal`], but also attaches similar-goal summaries when enabled.
+///
+/// Always computes `start` via the existing [`start_goal`] path first, so the
+/// replay decision is identical to the summaries-absent path (Requirements
+/// 13.3, 14.1, 14.2, 15.1). Summarization is best-effort and reads only through
+/// the structured-first retrieval: when the [`SummaryProvider`] is disabled it
+/// yields an empty summary set without consulting retrieval, and when enabled it
+/// preserves retrieval order and degrades gracefully (Requirements 15.1, 15.2).
+///
+/// # Arguments
+///
+/// - `sig` — the new goal's intent signature (drives retrieval and Mode B opt-in).
+/// - `retrieval` — the structured-first retrieval engine.
+/// - `validator` — the Tier 1-backed evidence validator (see
+///   [`Tier1EvidenceValidator`]).
+/// - `mode_b_policy` — the Mode B opt-in policy.
+/// - `now` — the serve-time instant (used for Mode B age).
+/// - `summary_provider` — the opt-in similar-goal summary provider.
+pub fn start_goal_with_summaries(
+    sig: &IntentSignature,
+    retrieval: &impl Retrieval,
+    validator: &impl EvidenceValidator,
+    mode_b_policy: &impl ModeBPolicy,
+    now: Timestamp,
+    summary_provider: &SummaryProvider,
+) -> GoalStartWithSummaries {
+    // Compute the replay decision via the UNTOUCHED start_goal first, so the
+    // decision is identical whether or not summaries are enabled (Requirements
+    // 13.3, 14.1, 14.2, 15.1).
+    let start = start_goal(sig, retrieval, validator, mode_b_policy, now);
+    // Attach summaries best-effort; summaries_for reads through the same
+    // structured-first retrieval and honors the opt-in config (Requirements
+    // 15.1, 15.2).
+    let summaries = summary_provider.summaries_for(sig, retrieval);
+    GoalStartWithSummaries { start, summaries }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,7 +385,7 @@ mod tests {
     use crate::tier2::store::InMemoryMemoryStore;
     use crate::tier2::{
         AllowListModeB, Author, AuthorError, CleanContext, DenyAllModeB, Embedding, Granularity,
-        InMemoryRecurrenceTracker, InductionEngine, Judge, JudgeVerdict,
+        InMemoryRecurrenceTracker, InductionEngine, Judge, JudgeVerdict, SummaryConfig,
     };
     use crate::types::{
         CanonicalJson, ContentRef, Duration, EventKey, EventSeq, GoalNodeId, IntentSignature,
@@ -895,6 +952,187 @@ mod tests {
                 assert!(!verified, "Mode B is always believed-unverified");
             }
             other => panic!("expected Mode B ServeAnswer, got {other:?}"),
+        }
+    }
+
+    // --- Task 9.3: empty-candidate resilience (Requirements 14.2, 15.1) ---
+
+    #[test]
+    fn start_goal_with_summaries_empty_candidates_yields_empty_and_from_scratch() {
+        // Requirement 14.2: when retrieval returns no candidates, `summaries` is
+        // empty and `start` is the from-scratch replay decision. An empty store
+        // yields no structured head and (with an available embedder) an empty
+        // ann_recall, so retrieval returns no candidates.
+        let provider = FakeProvider::new();
+        let cache = InMemoryTier1Cache::new();
+        let resolver = MapResolver::new();
+        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
+
+        let store = InMemoryMemoryStore::new();
+        let embedder = FixedEmbedder;
+        let retrieval = MemoryRetrieval::new(&store, &embedder);
+
+        // Enabled provider, but no candidates => empty summaries + FromScratch.
+        let summary_provider = SummaryProvider::new(SummaryConfig {
+            enabled: true,
+            max_summaries: None,
+        });
+        let with = start_goal_with_summaries(
+            &sig(),
+            &retrieval,
+            &validator,
+            &DenyAllModeB,
+            Timestamp(0),
+            &summary_provider,
+        );
+        assert_eq!(
+            with.start,
+            GoalStart::FromScratch,
+            "no candidates => from-scratch replay decision"
+        );
+        assert!(
+            with.summaries.is_empty(),
+            "no candidates => empty summary set"
+        );
+    }
+
+    #[test]
+    fn start_goal_with_summaries_disabled_matches_start_goal() {
+        // Requirement 15.1: a disabled provider yields the same `start` as
+        // `start_goal` and produces no freshly retrieved summaries. Use a
+        // non-empty store so `start_goal` returns a real replay decision.
+        let provider = FakeProvider::new().with_content("file://a", b"v1");
+        let cache = InMemoryTier1Cache::new();
+        let source = pinnable("file://a");
+        let token = cache.issue_token(&source, &provider).expect("issue");
+        let resolver = MapResolver::new().with(&token, source.clone());
+        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
+
+        let store = InMemoryMemoryStore::new();
+        store
+            .insert(
+                key("n"),
+                memory_with("m", Some(sound_outcome(vec![token])), vec![]),
+            )
+            .expect("valid insert");
+        let embedder = FixedEmbedder;
+        let retrieval = MemoryRetrieval::new(&store, &embedder);
+
+        let plain = start_goal(&sig(), &retrieval, &validator, &DenyAllModeB, Timestamp(0));
+
+        let summary_provider = SummaryProvider::new(SummaryConfig::default());
+        let with = start_goal_with_summaries(
+            &sig(),
+            &retrieval,
+            &validator,
+            &DenyAllModeB,
+            Timestamp(0),
+            &summary_provider,
+        );
+
+        assert_eq!(
+            with.start, plain,
+            "a disabled provider leaves the replay decision identical to start_goal"
+        );
+        assert!(
+            with.summaries.is_empty(),
+            "a disabled provider produces no freshly retrieved summaries"
+        );
+    }
+
+    // --- Task 9.2: Property 11 — summaries are additive -------------------
+
+    use proptest::prelude::*;
+
+    /// A batch of `n` valid, applicable memories with distinct ids, varying
+    /// kind so both dead-end and non-dead-end summaries are exercised. Each
+    /// applies to `sig()` (unconstrained applicability from `memory_with`).
+    fn arb_summary_scenario() -> impl Strategy<Value = (usize, bool, Option<usize>)> {
+        (
+            0_usize..6,               // number of memories in the store
+            any::<bool>(),            // provider enabled?
+            prop::option::of(0_usize..6), // max_summaries
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: sqlite-memory-store, Property 11: Summaries are additive and
+        // never alter the replay decision.
+        //
+        // Validates: Requirements 13.3, 14.1, 14.2.
+        #[test]
+        fn summaries_are_additive_and_never_alter_replay(
+            (count, enabled, max_summaries) in arb_summary_scenario()
+        ) {
+            // Deterministic validator/provider so both calls see identical inputs.
+            let provider = FakeProvider::new().with_content("file://a", b"v1");
+            let cache = InMemoryTier1Cache::new();
+            let source = pinnable("file://a");
+            let token = cache.issue_token(&source, &provider).expect("issue");
+            let resolver = MapResolver::new().with(&token, source.clone());
+            let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
+
+            // Build a store with `count` applicable memories (some with cached
+            // sound outcomes, some without) so the top candidate varies across
+            // scenarios. Reads never mutate the store, so one store is fine for
+            // both calls.
+            let store = InMemoryMemoryStore::new();
+            for i in 0..count {
+                let id = format!("m-{i}");
+                let cached = if i % 2 == 0 {
+                    Some(sound_outcome(vec![token.clone()]))
+                } else {
+                    None
+                };
+                let items = if cached.is_some() {
+                    vec![]
+                } else {
+                    vec![contract_item("read_file", "{}", token.clone())]
+                };
+                store
+                    .insert(key(&format!("n-{i}")), {
+                        let mut mem = memory_with(&id, cached, items);
+                        // Vary kind so Negative dead-ends are also summarized.
+                        if i % 3 == 2 {
+                            mem.kind = MemoryKind::Negative;
+                            // Negative memories require a non-empty contract.
+                            mem.cached_outcome = None;
+                            mem.evidence_contract = EvidenceContract {
+                                items: vec![contract_item(
+                                    "read_file",
+                                    "{}",
+                                    token.clone(),
+                                )],
+                            };
+                        }
+                        mem
+                    })
+                    .expect("valid insert");
+            }
+            let embedder = FixedEmbedder;
+            let retrieval = MemoryRetrieval::new(&store, &embedder);
+
+            let summary_provider = SummaryProvider::new(SummaryConfig {
+                enabled,
+                max_summaries,
+            });
+
+            // The plain replay decision and the additive one must agree on
+            // `start`, regardless of enablement or produced summaries.
+            let plain =
+                start_goal(&sig(), &retrieval, &validator, &DenyAllModeB, Timestamp(0));
+            let with = start_goal_with_summaries(
+                &sig(),
+                &retrieval,
+                &validator,
+                &DenyAllModeB,
+                Timestamp(0),
+                &summary_provider,
+            );
+
+            prop_assert_eq!(with.start, plain);
         }
     }
 }

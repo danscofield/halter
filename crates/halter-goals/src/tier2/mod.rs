@@ -13,7 +13,9 @@ pub mod induction;
 pub mod memory;
 pub mod replay;
 pub mod retrieval;
+pub mod sqlite_store;
 pub mod store;
+pub mod summary;
 
 pub use induction::{
     Author, AuthorError, CleanContext, Decision, DeclineRecord, DistilledNode, FailureRecord,
@@ -32,4 +34,6 @@ pub use replay::{
 pub use retrieval::{
     cheap_score, EmbeddingSource, MemoryRetrieval, Retrieval, ScoredMemory, HEAD_MIN, TAIL_LIMIT,
 };
+pub use sqlite_store::{SqliteMemoryStore, SqliteStoreError};
 pub use store::{InMemoryMemoryStore, MemoryStore, MemoryStoreError};
+pub use summary::{GoalSummary, SummaryConfig, SummaryProvider};

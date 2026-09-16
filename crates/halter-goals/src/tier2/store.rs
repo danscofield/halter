@@ -272,7 +272,7 @@ impl InMemoryMemoryStore {
 /// Returns a value in `[0, 2]` where `0` is identical direction. Zero-magnitude
 /// vectors (including empty ones) are treated as maximally distant (`2.0`) so
 /// they sort last, keeping ranking well-defined without panicking.
-fn cosine_distance(a: &Embedding, b: &Embedding) -> f32 {
+pub(crate) fn cosine_distance(a: &Embedding, b: &Embedding) -> f32 {
     let len = a.0.len().min(b.0.len());
     let mut dot = 0.0_f32;
     let mut norm_a = 0.0_f32;
