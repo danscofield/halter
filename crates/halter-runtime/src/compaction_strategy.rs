@@ -3,14 +3,14 @@
 //! compaction may run at — and a [`CompactionStrategy`] owns *what happens*.
 // pattern: Imperative Shell
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use halter_protocol::{
-    AssistantMessage, Message, ObservedState, PendingEvent, PromptSegment, ProviderRequest,
-    ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEventPayload, SessionId,
-    SessionState, ToolCall, ToolSpec, TurnId, Usage,
+    AssistantMessage, GoalNodeId, Message, MessageId, ObservedState, PendingEvent, PromptSegment,
+    ProviderRequest, ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEventPayload,
+    SessionId, SessionState, ToolCall, ToolSpec, TurnId, Usage,
 };
 use halter_goals::{GoalEvent, GoalStore, GoalStoreError, GoalTree};
 use halter_providers::Provider;
@@ -229,6 +229,51 @@ impl<'a> GoalLog<'a> {
                 _ => None,
             })
             .collect())
+    }
+
+    /// Replay the shared session log and map each message id to the goal node
+    /// that owned the `MessageItem` event which emitted it. Built from the
+    /// same [`SessionStore::replay`] read [`goal_events`](Self::goal_events)
+    /// performs, keeping only `MessageItem { message, goal_node: Some(n) }`
+    /// payloads and recording `message id -> n`. Messages whose event carried
+    /// `goal_node = None`, or that have no `MessageItem` event, are absent from
+    /// the map (⇒ unmapped). Read-only: the log is not mutated, and the mapping
+    /// depends only on the committed `goal_node` tags, never on message
+    /// content (Requirements 2.2, 8.3).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any failure replaying the shared session log as a
+    /// [`GoalStoreError::Log`].
+    pub(crate) async fn message_owners(
+        &self,
+    ) -> Result<HashMap<MessageId, GoalNodeId>, GoalStoreError> {
+        let events = self
+            .sessions
+            .replay(self.session_id)
+            .await
+            .map_err(|err| GoalStoreError::Log(err.to_string()))?;
+        let mut owners = HashMap::new();
+        for event in events {
+            if let SessionEventPayload::MessageItem {
+                message,
+                goal_node: Some(node),
+            } = event.payload
+            {
+                owners.insert(message_id(&message), node);
+            }
+        }
+        Ok(owners)
+    }
+}
+
+/// The stable [`MessageId`] carried by any transcript [`Message`] variant.
+fn message_id(message: &Message) -> MessageId {
+    match message {
+        Message::System(m) => m.id.clone(),
+        Message::User(m) => m.id.clone(),
+        Message::Assistant(m) => m.id.clone(),
+        Message::Tool(m) => m.id.clone(),
     }
 }
 

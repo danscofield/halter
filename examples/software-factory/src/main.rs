@@ -1111,6 +1111,7 @@ fn default_factory_config() -> HarnessConfig {
             max_tokens: None,
             compaction: CompactionStrategyKind::default(),
             notes_root: None,
+            ..ContextConfig::default()
         },
         tools: ToolsConfig {
             enabled: factory_example_tools()

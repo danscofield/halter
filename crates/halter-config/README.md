@@ -430,6 +430,13 @@ Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolv
   50% and 75% of the threshold. Above 90%, the runtime requests a checkpoint
   and wipes the conversation even if the model ignores it. `new_context`
   requests an earlier wipe. The turn continues from a recovery prompt.
+- `goal_oriented`: compresses the transcript along the session's goal-tree
+  boundaries. Maximal fully-closed goal subtrees distill to their outcome
+  while the open frontier and unmapped messages are kept verbatim; it falls
+  back to `model_summary` whenever the tree is thin or the transcript is
+  largely unmapped, so it is never worse than the default. Requires
+  `goal_tracking = auto` — without it no goal tree is tracked and every pass
+  falls back to `model_summary` (`HalterBuilder::build` logs a warning).
 
 `notes_root` is fixed when the harness is built; changing a session's working
 directory does not move its notes. With an explicit `sessions.sqlite_path`,

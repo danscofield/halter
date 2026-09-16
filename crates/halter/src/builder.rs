@@ -28,7 +28,8 @@ use halter_providers::{
 };
 use halter_runtime::{
     CleanWindow, CompactionStrategy, ContextSettings, DefaultContextManager,
-    DefaultPromptAssembler, EventBus, GoalAttributionMode, HalterSession, ModelSummary,
+    DefaultPromptAssembler, EventBus, GoalAttributionMode, GoalOrientedCompaction, HalterSession,
+    ModelSummary,
     ProviderDefault, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime, StoreSearch,
     TraceRecorder, WindowPolicy,
 };
@@ -37,7 +38,7 @@ use halter_tools::{
     DefaultToolPolicy, GoalTool, LoopbackAllow, PathLockMap, PolicySettings, ShellMode, Tool,
     ToolRuntime, ToolSessionStore, register_builtin_tools, register_subagent_tools,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 
@@ -300,6 +301,22 @@ impl HalterBuilder {
         // per-session `ActiveGoalStack` (created lazily on first use). When
         // `off`, register no goal tool, leave the Goal Model dormant, and stamp
         // no tag — byte-identical to today.
+        // The goal-oriented strategy is a pure reader of the goal tree the
+        // auto-mode attribution context builds. With `goal_tracking != auto`
+        // no `GoalStore` is wired, so `goal_log()` returns `None` and every
+        // compaction pass falls back to `ModelSummary` — the strategy is inert.
+        // Warn so the misconfiguration is visible instead of silently
+        // degrading.
+        if resolved_context.compaction == CompactionStrategyKind::GoalOriented
+            && resolved_context.goal_tracking != GoalTrackingMode::Auto
+        {
+            warn!(
+                "context.compaction = \"goal_oriented\" has no effect while context.goal_tracking \
+                 != \"auto\": no goal tree is tracked, so every compaction pass falls back to \
+                 \"model_summary\"; set context.goal_tracking = \"auto\" to enable it"
+            );
+        }
+
         let (goal_tracking, goal_store) = match resolved_context.goal_tracking {
             GoalTrackingMode::Auto => {
                 let store: Arc<dyn GoalStore> = Arc::new(EventLogGoalStore::new(
@@ -580,6 +597,7 @@ fn configured_compaction(
             anyhow::bail!("CleanWindow requires the session store and notes root")
         }
         CompactionStrategyKind::ModelSummary => Ok(Arc::new(ModelSummary)),
+        CompactionStrategyKind::GoalOriented => Ok(Arc::new(GoalOrientedCompaction::new())),
         CompactionStrategyKind::ProviderDefault => {
             let model = models.default_model()?;
             let capabilities = models.provider(&model.provider)?.capabilities();
@@ -1908,6 +1926,24 @@ mod tests {
             .build()
             .await
             .expect("provider_default builds when the provider compacts natively");
+    }
+
+    #[tokio::test]
+    async fn builder_installs_goal_oriented_compaction() {
+        // `goal_oriented` builds and is installed regardless of goal tracking;
+        // with `auto` the goal store is wired so the strategy can do real work,
+        // and without it the strategy still builds and safely falls back.
+        for goal_tracking in [GoalTrackingMode::Auto, GoalTrackingMode::Off] {
+            let mut config = openai_config(Some("test-key"));
+            config.context.compaction = CompactionStrategyKind::GoalOriented;
+            config.context.goal_tracking = goal_tracking;
+            HalterBuilder::default()
+                .with_config(config)
+                .with_resource_snapshot(ResourceSnapshot::empty())
+                .build()
+                .await
+                .expect("goal_oriented builds under both goal-tracking modes");
+        }
     }
 
     #[test]

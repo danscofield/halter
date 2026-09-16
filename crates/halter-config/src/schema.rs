@@ -1234,6 +1234,12 @@ pub enum CompactionStrategyKind {
     ProviderDefault,
     /// Wipe context and recover through notes, todos, and session history.
     CleanWindow,
+    /// Compress the transcript along the session's goal-tree boundaries:
+    /// maximal fully-closed subtrees distill to their outcome while the open
+    /// frontier and unmapped messages are preserved verbatim. Requires
+    /// `context.goal_tracking = auto` to have any effect; otherwise it falls
+    /// back to `model_summary` on every pass.
+    GoalOriented,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
