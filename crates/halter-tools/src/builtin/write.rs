@@ -38,6 +38,7 @@ impl Tool for WriteTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: false,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -61,8 +62,6 @@ impl Tool for WriteTool {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
-        Ok(ToolResult::Json {
-            value: json!({ "path": canonical_path }),
-        })
+        Ok(ToolResult::json(json!({ "path": canonical_path })))
     }
 }

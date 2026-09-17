@@ -8,7 +8,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AssistantPart, Message, PromptSegment, StopReason, ToolResult, ToolSpec, UserPart};
+use crate::{
+    AssistantPart, Message, PromptSegment, StopReason, ToolResultKind, ToolSpec, UserPart,
+};
 
 const CURRENT_ACCOUNTING_VERSION: u8 = 1;
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
@@ -273,10 +275,10 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
                 }
             })
             .sum(),
-        Message::Tool(message) => match &message.content {
-            ToolResult::Empty => 0,
-            ToolResult::Text { text } => estimate_text_tokens(text),
-            ToolResult::Json { value } => estimate_json_tokens(value),
+        Message::Tool(message) => match &message.content.kind {
+            ToolResultKind::Empty => 0,
+            ToolResultKind::Text { text } => estimate_text_tokens(text),
+            ToolResultKind::Json { value } => estimate_json_tokens(value),
         },
     })
 }
@@ -331,7 +333,7 @@ mod tests {
     use super::*;
     use crate::{
         AssistantMessage, CacheScope, MessageId, PromptSegmentId, PromptSegmentKind, SessionState,
-        ToolCapabilities, ToolConcurrency, Usage, UserMessage, Volatility,
+        ToolCapabilities, ToolConcurrency, ToolResult, Usage, UserMessage, Volatility,
     };
 
     fn assistant(text: &str, stop_reason: Option<StopReason>, usage: Option<Usage>) -> Message {
@@ -637,16 +639,14 @@ mod tests {
         let empty_tool = Message::Tool(crate::ToolResultMessage {
             id: MessageId::new(),
             call_id: crate::ToolCallId::from("call_1"),
-            content: ToolResult::Empty,
+            content: ToolResult::empty(),
             error: None,
             created_at: Utc::now(),
         });
         let json_tool = Message::Tool(crate::ToolResultMessage {
             id: MessageId::new(),
             call_id: crate::ToolCallId::from("call_2"),
-            content: ToolResult::Json {
-                value: json!({"b": true, "a": "abcd"}),
-            },
+            content: ToolResult::json(json!({"b": true, "a": "abcd"})),
             error: None,
             created_at: Utc::now(),
         });

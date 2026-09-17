@@ -4,17 +4,29 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use halter_config::{
     CompactionStrategyKind, ConfiguredProvider, DEFAULT_MODEL_ID, GoalTrackingMode, HarnessConfig,
     ModelConfig,
     ModelJudgeConfig, ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig,
     PromptsConfig, ResilienceConfig, ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID,
     SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, ShellModeConfig, SystemPromptPreset,
+    DEFAULT_TOOL_CACHE_TTL_SECS, ToolCacheBackend,
     expand_path, load_path, resolve_provider_runtime_config,
 };
-use halter_goals::{EventLogGoalStore, GoalStore, SessionStoreGoalEventLog};
+use halter_goals::{
+    AdvisorySummary, Author, EmbeddingSource, EngineInductionQueue, EventLogGoalStore,
+    GoalResolutionAuthor, GoalResolutionJudge, GoalStore, InductionEngine, InMemoryMemoryStore,
+    InMemoryRecurrenceTracker, IntentSignature, Judge, MemoryEmbeddingWriter, MemoryRetrieval,
+    MemoryStore, OpenAiEmbeddingSource, ResolvedEmbeddingSettings, SessionStoreGoalEventLog,
+    SharedInductionQueue, retrieve_advisory,
+};
+use halter_goals::tier2::{RecurrenceTracker, SummaryConfig, SummaryProvider};
+#[cfg(feature = "sqlite")]
+use halter_goals::SqliteMemoryStore;
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
     HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderCapabilities, ProviderName,
@@ -22,9 +34,9 @@ use halter_protocol::{
 };
 use halter_providers::{
     AnthropicProvider, DefaultProviderErrorClassifier, FullTurnJudgePlan, FullTurnPanelist,
-    ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider,
-    OpenRouterProvider, Provider, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
-    RetryPolicy,
+    ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiEmbeddingClient,
+    OpenAiOAuthCredentials, OpenAiProvider, OpenRouterProvider, Provider, ProviderErrorClassifier,
+    ProviderTimeouts, ResiliencePolicy, RetryPolicy,
 };
 use halter_runtime::{
     CleanWindow, CompactionStrategy, ContextSettings, DefaultContextManager,
@@ -35,8 +47,9 @@ use halter_runtime::{
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
-    DefaultToolPolicy, GoalTool, LoopbackAllow, PathLockMap, PolicySettings, ShellMode, Tool,
-    ToolRuntime, ToolSessionStore, register_builtin_tools, register_subagent_tools,
+    DefaultToolPolicy, GoalRetrieval, GoalTool, InMemoryToolResultStore, LoopbackAllow,
+    PathLockMap, PolicySettings, ShellMode, Tool, ToolResultStore, ToolRuntime, ToolSessionStore,
+    register_builtin_tools, register_subagent_tools,
 };
 use tracing::{debug, info, warn};
 
@@ -276,7 +289,39 @@ impl HalterBuilder {
             }
             None => configured_compaction(resolved_context.compaction, &models)?,
         };
-        let tools = Arc::new(ToolRuntime::new());
+        // Tool-result cache wiring (task 8.1). When `[tools].cache_enabled`,
+        // install the configured backend on the runtime before it is shared.
+        // `memory` is the only backend implemented today; `redis`/`sqlite` are
+        // recognized by config but fail the build fast until they land. When
+        // caching is disabled we install no store, preserving today's behavior.
+        let mut tools = ToolRuntime::new();
+        if config.tools.cache_enabled {
+            match config.tools.tool_cache_backend {
+                ToolCacheBackend::Memory => {
+                    let ttl = Duration::from_secs(
+                        config
+                            .tools
+                            .tool_cache_ttl_secs
+                            .unwrap_or(DEFAULT_TOOL_CACHE_TTL_SECS),
+                    );
+                    let store: Arc<dyn ToolResultStore> = Arc::new(InMemoryToolResultStore::new());
+                    tools.with_cache(store, ttl);
+                    info!(
+                        cache_enabled = true,
+                        backend = ?ToolCacheBackend::Memory,
+                        ttl_secs = ttl.as_secs(),
+                        "installed tool-result cache"
+                    );
+                }
+                ToolCacheBackend::Redis => {
+                    anyhow::bail!("tool cache backend 'redis' is not yet supported")
+                }
+                ToolCacheBackend::Sqlite => {
+                    anyhow::bail!("tool cache backend 'sqlite' is not yet supported")
+                }
+            }
+        }
+        let tools = Arc::new(tools);
         register_builtin_tools(&tools, &config.tools.enabled);
         // Strategy tools sit between the built-ins and explicitly supplied
         // tools. CleanWindow recovery names are reserved; other explicit tools win.
@@ -319,11 +364,104 @@ impl HalterBuilder {
 
         let (goal_tracking, goal_store) = match resolved_context.goal_tracking {
             GoalTrackingMode::Auto => {
-                let store: Arc<dyn GoalStore> = Arc::new(EventLogGoalStore::new(
+                // Tier 2 retrieval-path construction (task 15.2), following the
+                // design's "Capability A — builder-time construction graph"
+                // (steps 3–13). Enablement is derived solely from
+                // `goal_tracking = auto` + `[embedding]` + the session backend
+                // (Req 2.1, 2.5): under `auto` the full path is always built,
+                // regardless of whether embedding is enabled — a disabled
+                // embedding degrades to structured-head-only retrieval, it does
+                // not skip construction (Req 2.1, 2.4).
+
+                // (3–6) Resolve the shared embedding settings and build the
+                // query-path source + write-path writer from that single value
+                // so both paths agree on model and dimension (Req 3, 8.1). A
+                // missing credential is non-fatal — the source/writer degrade
+                // to `None`/`Unavailable` with no network call (Req 3.4, 10.2).
+                // `[embedding]` validation already ran in `config.validate()`
+                // above, before any Tier 2 component is constructed (Req 12.1,
+                // 12.2).
+                let settings = resolve_embedding_settings(&config);
+                let memory_backend_label = describe_session_backend(&config.sessions);
+                let components = build_embedding_components(&settings, memory_backend_label)?;
+
+                // (7) Build the memory store, mirroring the session backend
+                // (Req 4). Shared by retrieval and induction.
+                let mem_store = build_memory_store(&config.sessions)?;
+
+                // (8) Build the induction engine over the shared memory store,
+                // routing inserts through the writer so induced memories store
+                // real embeddings (Req 6). Memories are authored deterministically
+                // from the agent-supplied resolved-goal data — no model call.
+                // A single-occurrence threshold authors a solved goal the first
+                // time it closes (there is no config field for this today).
+                const INDUCTION_RECURRENCE_THRESHOLD: u64 = 1;
+                let tracker: Arc<dyn RecurrenceTracker> =
+                    Arc::new(InMemoryRecurrenceTracker::new());
+                let judge: Arc<dyn Judge> = Arc::new(GoalResolutionJudge::new());
+                let author: Arc<dyn Author> = Arc::new(GoalResolutionAuthor::new());
+                // The engine is generic over a `Sized` store; the shared store
+                // is a trait object, so wrap the shared `Arc` once more. The
+                // blanket `MemoryStore` impl on `Arc<dyn MemoryStore + Send +
+                // Sync>` makes this delegate to the same underlying store the
+                // advisory path reads (Req 4.3).
+                let engine = Arc::new(InductionEngine::with_writer(
+                    Arc::new(mem_store.clone()),
+                    tracker,
+                    judge,
+                    author,
+                    INDUCTION_RECURRENCE_THRESHOLD,
+                    components.writer,
+                    components.source_dimension,
+                ));
+
+                // (9–11) Break the goal-store/queue/engine construction knot.
+                // The queue needs a `GoalStore` handle only to *resolve* closed
+                // nodes, which it does independently of which queue the store
+                // holds. So build a second `EventLogGoalStore` over a clone of
+                // the same session-backed log as the queue's resolution handle,
+                // then wire the mutation store with that queue (Req 7.1).
+                let resolution_store = Arc::new(EventLogGoalStore::new(
                     SessionStoreGoalEventLog::new(sessions.clone()),
                 ));
-                tools.register(Arc::new(GoalTool::new(store.clone())));
-                (GoalAttributionMode::Auto, Some(store))
+                let queue: SharedInductionQueue =
+                    Arc::new(EngineInductionQueue::new(resolution_store, engine));
+                let goal_store: Arc<dyn GoalStore> = Arc::new(
+                    EventLogGoalStore::with_induction_queue(
+                        SessionStoreGoalEventLog::new(sessions.clone()),
+                        queue,
+                    ),
+                );
+
+                // (12) The hot-path advisory adapter: shares the memory store
+                // and query-path source with induction, and runs advisory-only
+                // retrieval (no verification) on goal open (Req 5).
+                let advisory = Arc::new(RuntimeGoalRetrieval {
+                    store: mem_store.clone(),
+                    source: components.source,
+                    summary: SummaryProvider::new(SummaryConfig::default()),
+                });
+
+                // (13) Register the goal tool wired with the advisory seam.
+                tools.register(Arc::new(GoalTool::with_retrieval(
+                    goal_store.clone(),
+                    advisory,
+                )));
+
+                // (Req 12.3) When `auto` is active but embedding is disabled,
+                // emit a diagnostic that the Tier 2 path runs with
+                // structured-head-only retrieval. Only non-secret attributes are
+                // logged (Req 11.2, 11.3).
+                if !settings.enabled {
+                    info!(
+                        embedding_enabled = false,
+                        memory_backend = memory_backend_label,
+                        "tier 2 retrieval path active with structured-head-only retrieval \
+                         (embedding disabled)"
+                    );
+                }
+
+                (GoalAttributionMode::Auto, Some(goal_store))
             }
             GoalTrackingMode::Off => (GoalAttributionMode::Off, None),
         };
@@ -358,6 +496,9 @@ impl HalterBuilder {
             trace_recorder,
             goal_tracking,
             goal_store,
+            // Task 15.2 populates the real `Some(Tier2Services { .. })` under
+            // `auto`; this task only adds the field, so keep it `None` for now.
+            tier2: None,
         });
         let runtime = SessionRuntime::new(services.clone());
         register_subagent_tools(
@@ -576,6 +717,96 @@ fn describe_session_backend(config: &SessionsConfig) -> &'static str {
     match config.backend {
         SessionBackend::Memory => "memory",
     }
+}
+
+/// Construct the Tier 2 `MemoryStore`, mirroring the session backend selection
+/// (Req 4.1–4.4, Q6). `memory` ⇒ an in-memory store; `sqlite` ⇒ a
+/// `SqliteMemoryStore` opened at a distinct `memory.sqlite3` sibling of the
+/// session database, mapping an open/initialize failure to a build error that
+/// identifies the memory-store initialization failure (Req 4.4). Returned as an
+/// `Arc<dyn MemoryStore>` (a `&self` interior-mutability trait) so the same
+/// handle is shared by retrieval and induction without changing the trait
+/// contract (Req 4.3).
+#[cfg(feature = "sqlite")]
+fn build_memory_store(
+    config: &SessionsConfig,
+) -> anyhow::Result<Arc<dyn MemoryStore + Send + Sync>> {
+    match config.backend {
+        SessionBackend::Memory => Ok(Arc::new(InMemoryMemoryStore::new())),
+        SessionBackend::Sqlite => {
+            let path = memory_store_path(config);
+            let store = SqliteMemoryStore::open(&path).with_context(|| {
+                format!(
+                    "failed to initialize sqlite memory store at {}",
+                    path.display()
+                )
+            })?;
+            Ok(Arc::new(store))
+        }
+    }
+}
+
+/// Construct the Tier 2 `MemoryStore` when the `sqlite` feature is absent. The
+/// session-store schema forecloses `backend = sqlite` without the feature, so
+/// only the in-memory arm is reachable (Req 4.1, 4.3).
+#[cfg(not(feature = "sqlite"))]
+fn build_memory_store(
+    config: &SessionsConfig,
+) -> anyhow::Result<Arc<dyn MemoryStore + Send + Sync>> {
+    match config.backend {
+        SessionBackend::Memory => Ok(Arc::new(InMemoryMemoryStore::new())),
+    }
+}
+
+/// The path of the sqlite Tier 2 memory database (Q6): a distinct
+/// `memory.sqlite3` sibling in the session database's directory, never the
+/// session DB itself. When no session path is configured, fall back to the
+/// default halter data directory.
+#[cfg(feature = "sqlite")]
+fn memory_store_path(config: &SessionsConfig) -> PathBuf {
+    match config.sqlite_path.as_ref() {
+        Some(session_path) => {
+            let expanded = expand_path(session_path);
+            let dir = expanded
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            dir.join("memory.sqlite3")
+        }
+        None => default_halter_dir().join("memory.sqlite3"),
+    }
+}
+
+/// The default halter data directory, matching the session store's default-path
+/// convention: `$XDG_DATA_HOME/halter`, else `%LOCALAPPDATA%/halter` on Windows
+/// or `$HOME/.local/share/halter` on Unix. Falls back to a temp-dir sibling if
+/// neither is resolvable, so `memory_store_path` remains total.
+#[cfg(feature = "sqlite")]
+fn default_halter_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path).join("halter");
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) =
+            env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(local_app_data).join("halter");
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("halter");
+        }
+    }
+
+    env::temp_dir().join("halter")
 }
 
 #[derive(Clone)]
@@ -1174,6 +1405,148 @@ where
     F: FnMut(&str) -> anyhow::Result<Option<String>>,
 {
     resolve_provider_runtime_config(provider, config.provider_config(provider), lookup_env)
+}
+
+/// Resolve embedding settings from `[embedding]` + OpenAI provider auth,
+/// treating a MISSING credential as non-fatal (Req 3.3, 3.4, 10.2, 11.1).
+///
+/// This reuses the same OpenAI credential resolution/precedence the model
+/// registry applies (via `resolve_selected_provider_config`, which resolves
+/// `ConfiguredProvider::OpenAi` against the config plus the process
+/// environment). For the embedding path only, the no-credential `Err` is
+/// caught and an empty bearer is synthesized so `build` still succeeds; both
+/// `OpenAiEmbeddingSource` and `MemoryEmbeddingWriter` read the empty bearer as
+/// "no credential" and degrade to `None`/`Unavailable` with no network call.
+fn resolve_embedding_settings(config: &HarnessConfig) -> ResolvedEmbeddingSettings {
+    let auth = match resolve_selected_provider_config(config, ConfiguredProvider::OpenAi) {
+        Ok(resolved) => resolved.auth,
+        Err(_) => ResolvedProviderAuth::ApiKey(String::new()),
+    };
+    ResolvedEmbeddingSettings::resolve(&config.embedding, &auth)
+}
+
+/// The query-path source, write-path writer, and shared source dimension the
+/// auto-mode Tier 2 wiring hands to retrieval and induction respectively.
+///
+/// The source is erased behind `Arc<dyn EmbeddingSource>` so retrieval needs no
+/// embedding-transport generic; the writer keeps its concrete
+/// `OpenAiEmbeddingClient` transport so induction can await `embed_for_write`
+/// (`InductionEngine::with_writer` is generic over the client). Both derive
+/// from a single `ResolvedEmbeddingSettings` so their model and dimension agree
+/// (Req 8.1), and `source_dimension` is that shared dimension, passed to
+/// `insert_memory_with_writer` for the writer/source consistency check
+/// (Req 8.2).
+struct EmbeddingComponents {
+    /// The shared configured dimension (`Req 8.1`), also the
+    /// `source_dimension` argument to `insert_memory_with_writer` (Req 8.2).
+    source_dimension: Option<u32>,
+    /// Query-path embedding source; its `enabled`/credential flags live inside
+    /// and drive the `None`-degradation contract.
+    source: Arc<dyn EmbeddingSource>,
+    /// Write-path embedding producer, built from the *same* settings as the
+    /// source so the two paths agree on model and dimension (Req 8.1).
+    writer: MemoryEmbeddingWriter<OpenAiEmbeddingClient>,
+}
+
+/// Build the query-path source (+ its client) and the write-path writer (+ its
+/// client) from a single `ResolvedEmbeddingSettings` value, so the query and
+/// write paths agree byte-for-byte on model and integer-for-integer on
+/// dimension (Req 3.1, 3.2, 8.1). Only the non-secret `enabled` flag and the
+/// selected memory-store backend are logged — never the credential the settings
+/// carry (Req 11.2, 11.3).
+///
+/// A missing credential is already folded into `settings` as an empty bearer by
+/// [`resolve_embedding_settings`], so both the source and the writer read it as
+/// "no credential" and degrade to `None`/`Unavailable` with no network call
+/// (Req 3.4). Two distinct clients are built so the query and write paths do not
+/// share transport state; both are configured from the same settings.
+///
+/// # Errors
+/// Fails only if the underlying HTTP transport cannot be constructed; a missing
+/// credential is non-fatal and never reaches this path as an error.
+fn build_embedding_components(
+    settings: &ResolvedEmbeddingSettings,
+    memory_backend: &str,
+) -> anyhow::Result<EmbeddingComponents> {
+    // Non-secret construction log: whether embedding is enabled and which
+    // memory-store backend was selected. The credential is never logged
+    // (Req 11.2, 11.3).
+    info!(
+        embedding_enabled = settings.enabled,
+        memory_backend,
+        "constructing tier 2 embedding source and writer"
+    );
+
+    // Per-attempt request timeout comes from the resolved settings; the rest of
+    // the resilience policy takes its defaults (the source/writer own their own
+    // attempt loop from `settings.max_attempts`).
+    let policy = ResiliencePolicy {
+        timeouts: ProviderTimeouts {
+            request: settings.timeout,
+            ..ProviderTimeouts::default()
+        },
+        ..ResiliencePolicy::default()
+    };
+
+    // Both paths agree on dimension because both derive from `settings`
+    // (Req 8.1). This is also the `source_dimension` the writer/source
+    // consistency check reads (Req 8.2).
+    let source_dimension = settings.dimension;
+
+    // Query-path client + source (Req 3.1, 3.2).
+    let client_q = OpenAiEmbeddingClient::new(
+        settings.bearer.clone(),
+        Some(settings.base_url.as_str()),
+        policy,
+    )
+    .context("failed to construct the query-path embedding client")?;
+    let source: Arc<dyn EmbeddingSource> =
+        Arc::new(OpenAiEmbeddingSource::new(client_q, settings.clone()));
+
+    // Write-path client + writer, built from the SAME settings (Req 8.1).
+    let client_w = OpenAiEmbeddingClient::new(
+        settings.bearer.clone(),
+        Some(settings.base_url.as_str()),
+        policy,
+    )
+    .context("failed to construct the write-path embedding client")?;
+    let writer = MemoryEmbeddingWriter::new(client_w, settings.clone());
+
+    Ok(EmbeddingComponents {
+        source_dimension,
+        source,
+        writer,
+    })
+}
+
+/// The runtime adapter that erases the concrete `MemoryStore`/`EmbeddingSource`
+/// generics behind the `GoalRetrieval` seam `GoalTool` consults on goal open
+/// (design § "The `GoalRetrieval` seam on `GoalTool`"). It owns the shared
+/// memory store, the query-path embedding source, and the summary provider, and
+/// on each call builds a `MemoryRetrieval` with the default head/tail bounds and
+/// runs the advisory-only `retrieve_advisory` — never `decide_replay`, no
+/// `EvidenceValidator`, no `ReplayDecision` (Req 5.1, 5.2, 5.3, 5.6). A degraded
+/// embedding backend yields a structured-head-only advisory without error
+/// (Req 5.6, 10.3).
+struct RuntimeGoalRetrieval {
+    /// Shared with induction so both paths observe the same memories.
+    store: Arc<dyn MemoryStore + Send + Sync>,
+    /// Query-path embedding source; its `enabled`/credential flags live inside
+    /// and drive the `None`-degradation contract. `EmbeddingSource` already
+    /// requires `Send + Sync`, so the bare trait object is thread-safe.
+    source: Arc<dyn EmbeddingSource>,
+    /// Similar-goal summaries; disabled providers add no work and no summaries.
+    summary: SummaryProvider,
+}
+
+#[async_trait]
+impl GoalRetrieval for RuntimeGoalRetrieval {
+    async fn retrieve_advisory(&self, intent: &IntentSignature) -> AdvisorySummary {
+        // Default `HEAD_MIN`/`TAIL_LIMIT` bounds keep the retrieval algorithm,
+        // ordering, dedup, and head/tail bounds unchanged (Req 5.6).
+        let retrieval = MemoryRetrieval::new(self.store.as_ref(), self.source.as_ref());
+        retrieve_advisory(intent, &retrieval, &self.summary).await
+    }
 }
 
 /// Every `PolicySettings` field comes from configuration now; `defaults`

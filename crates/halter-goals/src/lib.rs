@@ -17,8 +17,7 @@
 //! The [`integration`] module wires the subsystems into the two end-to-end flows
 //! the design shows in § "Example Usage": goal closure enqueuing induction
 //! asynchronously off the hot path ([`EngineInductionQueue`]), and the hot-path
-//! retrieval -> replay -> Tier 1 re-validation path
-//! ([`start_goal`]/[`Tier1EvidenceValidator`]).
+//! retrieval -> replay -> Tier 1 re-validation path ([`start_goal`]).
 //!
 //! # Public API
 //!
@@ -65,14 +64,16 @@ pub use tier1::{
 
 /// Tier 2 — induction, the memory store/retrieval, and replay.
 pub use tier2::{
-    decide_replay, AllowListModeB, Author, CachedOutcome, DenyAllModeB, EmbeddingSource,
-    EvidenceContract, EvidenceContractItem, EvidenceValidator, InMemoryMemoryStore,
-    InductionEngine, InductionOutcome, Judge, Memory, MemoryStore, MemoryRetrieval, ModeBPolicy,
-    Retrieval, ReplayDecision, ScoredMemory, TokensHold,
+    decide_replay, insert_memory_with_writer, AllowListModeB, Author, CachedOutcome, DenyAllModeB,
+    EmbeddingSource, EvidenceContract, EvidenceContractItem, EvidenceValidator,
+    GoalResolutionAuthor, GoalResolutionJudge, InMemoryMemoryStore, InductionEngine,
+    InductionOutcome, InMemoryRecurrenceTracker, Judge, Memory, MemoryEmbeddingWriter, MemoryStore,
+    MemoryRetrieval, ModeBPolicy, NoEmbeddingClient, OpenAiEmbeddingSource,
+    ResolvedEmbeddingSettings, Retrieval, ReplayDecision, ScoredMemory, SqliteMemoryStore,
+    SqliteStoreError, TokensHold,
 };
 
 /// Integration — the end-to-end wiring for the two design flows.
 pub use integration::{
-    start_goal, EngineInductionQueue, GoalStart, SourceResolution, SourceResolver,
-    Tier1EvidenceValidator,
+    retrieve_advisory, start_goal, AdvisorySummary, EngineInductionQueue, GoalStart,
 };

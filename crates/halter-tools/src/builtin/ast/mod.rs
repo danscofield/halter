@@ -68,6 +68,7 @@ impl Tool for AstGrepTool {
                 requires_approval: false,
                 cancellable: true,
                 long_running: true,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -109,7 +110,7 @@ impl Tool for AstGrepTool {
             other => anyhow::bail!("failed to execute ast_grep tool: unknown action '{other}'"),
         };
 
-        Ok(ToolResult::Json { value })
+        Ok(ToolResult::json(value))
     }
 }
 

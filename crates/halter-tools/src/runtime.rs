@@ -3,18 +3,42 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use halter_protocol::{
     CloseSubagentRequest, CloseSubagentResponse, ResourceSnapshot, SendSubagentInputRequest,
-    SessionBlueprint, SessionId, SessionState, SpawnSubagentRequest, SubagentStatus, ToolResult,
-    ToolSpec, WaitSubagentRequest, WaitSubagentResponse,
+    SessionBlueprint, SessionId, SessionState, SpawnSubagentRequest, SubagentStatus,
+    ToolConcurrency, ToolResult, ToolSpec, WaitSubagentRequest, WaitSubagentResponse,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::{PathLockMap, ToolPolicy, ToolSessionStore};
+use crate::{CacheKey, PathLockMap, ToolPolicy, ToolResultStore, ToolSessionStore};
+
+/// Default tool-result cache TTL, mirroring
+/// `halter_config::DEFAULT_TOOL_CACHE_TTL_SECS`.
+///
+/// This is only the field's default value on a freshly constructed runtime; the
+/// effective TTL is always the one supplied to [`ToolRuntime::with_cache`].
+const DEFAULT_TOOL_CACHE_TTL_SECS: u64 = 60;
+
+/// Determine whether a tool's calls are eligible for the tool-result cache.
+///
+/// A tool is cacheable iff it is explicitly opted in (`capabilities.cacheable`)
+/// AND it is side-effect-free: non-mutating and declared read-only or
+/// parallel-safe. Mutating or `Exclusive` tools are never cacheable, and the
+/// opt-in defaults to `false`, so caching never suppresses a tool with side
+/// effects (Req 15.1, 15.2, 15.3, 15.4, Q1).
+pub(crate) fn is_cacheable(spec: &ToolSpec) -> bool {
+    spec.capabilities.cacheable
+        && !spec.capabilities.mutating
+        && matches!(
+            spec.concurrency,
+            ToolConcurrency::ReadOnly | ToolConcurrency::ParallelSafe
+        )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Runtime event emitted while a tool executes.
@@ -120,17 +144,45 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult>;
 }
 
-#[derive(Default)]
 /// Registry and dispatcher for tools.
 pub struct ToolRuntime {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    /// Whether the tool-result cache is active. Defaults to `false`; only
+    /// [`with_cache`](ToolRuntime::with_cache) turns it on (Req 13.2, 13.4).
+    cache_enabled: bool,
+    /// The time-to-live applied to cached tool results. The default is a valid
+    /// placeholder; the effective TTL is set via
+    /// [`with_cache`](ToolRuntime::with_cache).
+    cache_ttl: Duration,
+    /// The backing store for cached tool results, or `None` when caching is
+    /// disabled (the default, and the state after `clone_filtered`).
+    store: Option<Arc<dyn ToolResultStore>>,
+}
+
+impl Default for ToolRuntime {
+    fn default() -> Self {
+        Self {
+            tools: RwLock::new(HashMap::new()),
+            cache_enabled: false,
+            cache_ttl: Duration::from_secs(DEFAULT_TOOL_CACHE_TTL_SECS),
+            store: None,
+        }
+    }
 }
 
 impl ToolRuntime {
-    /// Create an empty tool runtime.
+    /// Create an empty tool runtime with caching disabled.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable the tool-result cache, installing `store` and applying `ttl` to
+    /// cached entries (Req 13.2, 13.4).
+    pub fn with_cache(&mut self, store: Arc<dyn ToolResultStore>, ttl: Duration) {
+        self.cache_enabled = true;
+        self.store = Some(store);
+        self.cache_ttl = ttl;
     }
 
     /// Register or replace a tool by its canonical spec name.
@@ -186,18 +238,35 @@ impl ToolRuntime {
             .filter(|(name, _)| allow_all || allowed.contains(name))
             .map(|(name, tool)| (name.clone(), tool.clone()))
             .collect();
+        // A filtered clone never inherits the cache: it starts fresh with
+        // caching disabled and no store (Req 13.2, 13.4).
         Self {
             tools: RwLock::new(tools),
+            cache_enabled: false,
+            cache_ttl: Duration::from_secs(DEFAULT_TOOL_CACHE_TTL_SECS),
+            store: None,
         }
     }
 
     /// Execute a registered tool by name.
+    ///
+    /// When the tool-result cache is enabled and the tool is cacheable
+    /// (Req 15), an identical repeated call is short-circuited: within the TTL
+    /// window the stored result is returned tagged as a cache hit without
+    /// invoking the tool (Req 14.3/16.2/17.1); on a miss, expiry, or
+    /// non-canonicalizable arguments the tool is invoked and — on success — its
+    /// untagged result is stored under the resolved TTL (Req 14.4/14.6/16.3),
+    /// while an error propagates and stores nothing (Req 14.7/17.2). When the
+    /// cache is disabled/absent or the tool is not cacheable the dispatch is
+    /// byte-identical to the uncached path (Req 13.4/15.3/17.3).
     pub async fn execute(
         &self,
         name: &str,
         context: ToolContext,
         input: Value,
     ) -> anyhow::Result<ToolResult> {
+        // Look up the tool and release the read lock before any await so we
+        // never hold the lock across an await point.
         let tool = self
             .tools
             .read()
@@ -210,6 +279,50 @@ impl ToolRuntime {
             })?;
 
         debug!(session_id = %context.session_id, tool_name = name, "dispatching tool execution");
-        tool.execute(context, input).await
+
+        // Short-circuit to a byte-identical dispatch when the cache is disabled
+        // or absent, or the tool is not cacheable (Req 13.4/15.3/17.3).
+        let spec = tool.spec();
+        let Some(store) = self.store.as_ref().filter(|_| self.cache_enabled) else {
+            return tool.execute(context, input).await;
+        };
+        if !is_cacheable(&spec) {
+            return tool.execute(context, input).await;
+        }
+
+        // Compute the per-session cache key. Non-canonicalizable arguments
+        // bypass the cache entirely: invoke directly with no get/put (Req 14.2).
+        // `input` is cloned because `tool.execute` consumes it below.
+        let Some(key) = CacheKey::compute(&context.session_id, name, &input) else {
+            return tool.execute(context, input).await;
+        };
+        let key_string = key.to_key_string();
+
+        // On a hit within the TTL window, deserialize and return tagged without
+        // invoking the tool (Req 14.3/16.2/17.1). Corrupt or legacy bytes that
+        // fail to deserialize fall through to a miss (Req 14.5) — we do not
+        // return, we invoke the tool.
+        if let Some(bytes) = store.get(&key_string).await
+            && let Ok(result) = serde_json::from_slice::<ToolResult>(&bytes)
+        {
+            debug!(tool_name = name, "serving tool result from cache");
+            return Ok(result.with_cache_hit(true));
+        }
+
+        // Miss / expiry / undecodable: invoke the tool.
+        let result = tool.execute(context, input).await?;
+
+        // On success, serialize the untagged result and store it under the
+        // resolved TTL, then return it untagged (Req 14.4/14.6/16.3). On error
+        // the `?` above already propagated and stored nothing (Req 14.7/17.2).
+        match serde_json::to_vec(&result) {
+            Ok(bytes) => store.put(key_string, bytes, self.cache_ttl).await,
+            Err(error) => {
+                // A result that cannot be serialized is simply not cached; the
+                // fresh result is still returned untagged.
+                warn!(tool_name = name, %error, "failed to serialize tool result for cache");
+            }
+        }
+        Ok(result)
     }
 }

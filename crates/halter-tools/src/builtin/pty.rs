@@ -128,6 +128,7 @@ impl Tool for PtyTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: true,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -157,30 +158,22 @@ impl Tool for PtyTool {
                     .check_shell_command_strict(&config.command, mode)
                     .await?;
                 start_session(session, config, context.emit.clone()).await?;
-                Ok(ToolResult::Json {
-                    value: json!({ "started": true }),
-                })
+                Ok(ToolResult::json(json!({ "started": true })))
             }
             "write" => {
                 let input = required_string(&input, "input")?.to_owned();
                 send_control(&session, ControlMessage::Input(input))?;
-                Ok(ToolResult::Json {
-                    value: json!({ "ok": true }),
-                })
+                Ok(ToolResult::json(json!({ "ok": true })))
             }
             "resize" => {
                 let cols = checked_u16(&input, "cols", 120)?;
                 let rows = checked_u16(&input, "rows", 40)?;
                 send_control(&session, ControlMessage::Resize { cols, rows })?;
-                Ok(ToolResult::Json {
-                    value: json!({ "ok": true }),
-                })
+                Ok(ToolResult::json(json!({ "ok": true })))
             }
             "kill" => {
                 send_control(&session, ControlMessage::Kill)?;
-                Ok(ToolResult::Json {
-                    value: json!({ "ok": true }),
-                })
+                Ok(ToolResult::json(json!({ "ok": true })))
             }
             _ => anyhow::bail!("failed to execute pty tool: unknown action '{action}'"),
         }

@@ -79,10 +79,10 @@ impl SessionHistory {
                             .cloned()
                             .into_iter()
                             .collect(),
-                        match &result.content {
-                            halter_protocol::ToolResult::Text { text } => text.clone(),
-                            halter_protocol::ToolResult::Json { value } => value.to_string(),
-                            halter_protocol::ToolResult::Empty => result
+                        match &result.content.kind {
+                            halter_protocol::ToolResultKind::Text { text } => text.clone(),
+                            halter_protocol::ToolResultKind::Json { value } => value.to_string(),
+                            halter_protocol::ToolResultKind::Empty => result
                                 .error
                                 .as_ref()
                                 .map_or_else(String::new, |error| error.message.clone()),

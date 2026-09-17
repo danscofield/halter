@@ -9,6 +9,7 @@
 //! [`memory`]; the store, induction, retrieval, and replay engines are added by
 //! later tasks.
 
+pub mod embedding;
 pub mod induction;
 pub mod memory;
 pub mod replay;
@@ -17,10 +18,18 @@ pub mod sqlite_store;
 pub mod store;
 pub mod summary;
 
+pub use embedding::{embedding_input_text, EMPTY_FIELD_PLACEHOLDER, FIELD_SEPARATOR};
+pub use embedding::{EmbeddingCache, EmbeddingCacheKey};
+pub use embedding::{
+    insert_memory_with_writer, EmbeddingWriteError, MemoryEmbeddingWriter, OpenAiEmbeddingSource,
+    ResolvedEmbeddingSettings, WriteEmbedding, DEFAULT_EMBEDDING_BASE_URL,
+    MAX_EMBEDDING_MAX_ATTEMPTS, MIN_EMBEDDING_MAX_ATTEMPTS,
+};
 pub use induction::{
     Author, AuthorError, CleanContext, Decision, DeclineRecord, DistilledNode, FailureRecord,
-    Granularity, InMemoryRecurrenceTracker, InductionEngine, InductionLog, InductionOutcome,
-    Judge, JudgeVerdict, RecurrenceTracker,
+    GoalResolutionAuthor, GoalResolutionJudge, Granularity, InMemoryRecurrenceTracker,
+    InductionEngine, InductionLog, InductionOutcome, Judge, JudgeVerdict, NoEmbeddingClient,
+    RecurrenceTracker,
 };
 pub use memory::{
     AnswerMode, Applicability, CachedOutcome, Embedding, EvidenceContract,

@@ -1190,6 +1190,11 @@ pub struct ToolCapabilities {
     pub requires_approval: bool,
     pub cancellable: bool,
     pub long_running: bool,
+    /// Opt-in flag marking a side-effect-free tool as eligible for the
+    /// tool-result cache. Defaults to `false`; a tool must set this to `true`
+    /// (and be non-mutating, read-only/parallel-safe) to be cacheable.
+    #[serde(default)]
+    pub cacheable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1205,14 +1210,65 @@ pub struct ToolSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-/// Output returned by a tool execution.
-pub enum ToolResult {
+/// The payload of a tool result (the former `ToolResult` variants).
+pub enum ToolResultKind {
     /// No content.
     Empty,
     /// Plain text content.
     Text { text: String },
     /// Structured JSON content.
     Json { value: Value },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Output returned by a tool execution, with an optional cache-hit indicator.
+///
+/// The `kind` payload is flattened so the on-wire shape of the
+/// `kind`/`text`/`value` fields is unchanged; `cache_hit` is skipped when absent
+/// so pre-feature `ToolResult` bytes deserialize as not-from-cache.
+pub struct ToolResult {
+    #[serde(flatten)]
+    pub kind: ToolResultKind,
+    /// `Some(true)` iff served from the tool-result cache. `None` (absent on
+    /// the wire) means the result did not come from the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
+}
+
+impl ToolResult {
+    /// An empty tool result carrying no cache-hit indicator.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            kind: ToolResultKind::Empty,
+            cache_hit: None,
+        }
+    }
+
+    /// A plain-text tool result carrying no cache-hit indicator.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            kind: ToolResultKind::Text { text: text.into() },
+            cache_hit: None,
+        }
+    }
+
+    /// A structured-JSON tool result carrying no cache-hit indicator.
+    #[must_use]
+    pub fn json(value: Value) -> Self {
+        Self {
+            kind: ToolResultKind::Json { value },
+            cache_hit: None,
+        }
+    }
+
+    /// Return a copy tagged with the cache-hit indicator.
+    #[must_use]
+    pub fn with_cache_hit(mut self, hit: bool) -> Self {
+        self.cache_hit = Some(hit);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

@@ -31,9 +31,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use halter_goals::goal_model::intent::{IntentInput, derive_intent};
+use halter_goals::tier2::{GoalSummary, MemoryKind};
 use halter_goals::{
-    GoalNodeId, GoalNodeRevision, GoalStore, GoalStoreError, GoalTree, Resolution,
-    ToolCall as GoalToolCall,
+    AdvisorySummary, GoalNodeId, GoalNodeRevision, GoalStore, GoalStoreError, GoalTree,
+    IntentSignature, Resolution, ScoredMemory, ToolCall as GoalToolCall,
 };
 use halter_protocol::{
     SessionId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec,
@@ -148,28 +149,70 @@ impl GoalStackStore for InMemoryGoalStackStore {
     }
 }
 
+/// The hot-path advisory capability `GoalTool` consults when a goal opens.
+///
+/// This seam erases the concrete `MemoryStore`/`EmbeddingSource` generics behind
+/// one async method so `GoalTool` needs no Tier 2 type parameters. When a
+/// `GoalTool` holds `None` (off mode / no Tier 2 wiring) its behavior is
+/// byte-identical to today (Requirement 1.3). This method NEVER runs
+/// verification — it returns an advisory only (Requirement 5.4). It never errors:
+/// a degraded backend yields an empty or structured-head-only advisory
+/// (Requirements 5.5, 10.3).
+#[async_trait]
+pub trait GoalRetrieval: Send + Sync {
+    /// Retrieve the advisory for a newly-opened goal's intent.
+    async fn retrieve_advisory(&self, intent: &IntentSignature) -> AdvisorySummary;
+}
+
 /// The agent-facing goal tool (design § "Component 3: `GoalTool`").
 ///
 /// Holds a shared [`GoalStore`] handle (methods are keyed by `&SessionId`, so one
 /// store serves every session) and reaches the per-session active-goal stack
 /// through `ToolContext::tool_sessions`. Mirrors `TaskTool`'s action shape.
+///
+/// The optional [`GoalRetrieval`] seam folds a short advisory of applicable
+/// memories and similar-goal summaries into the `create` result when present;
+/// `None` preserves today's behavior exactly (Requirement 1.3).
 pub struct GoalTool {
     store: Arc<dyn GoalStore>,
+    /// `None` ⇒ byte-identical to today: no advisory is ever folded in.
+    retrieval: Option<Arc<dyn GoalRetrieval>>,
 }
 
 impl std::fmt::Debug for GoalTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoalTool")
             .field("store", &"<dyn GoalStore>")
+            .field(
+                "retrieval",
+                &self.retrieval.as_ref().map(|_| "<dyn GoalRetrieval>"),
+            )
             .finish()
     }
 }
 
 impl GoalTool {
-    /// Construct a goal tool over a shared [`GoalStore`].
+    /// Construct a goal tool over a shared [`GoalStore`] with no advisory seam.
+    ///
+    /// This is today's constructor: with `retrieval == None` the `create` result
+    /// is byte-identical to the pre-Tier-2 shape (Requirement 1.3).
     #[must_use]
     pub fn new(store: Arc<dyn GoalStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            retrieval: None,
+        }
+    }
+
+    /// Construct a goal tool wiring the advisory [`GoalRetrieval`] seam (auto
+    /// mode). On `create`, the advisory is folded into the JSON result
+    /// (Requirement 5.1, 5.3).
+    #[must_use]
+    pub fn with_retrieval(store: Arc<dyn GoalStore>, retrieval: Arc<dyn GoalRetrieval>) -> Self {
+        Self {
+            store,
+            retrieval: Some(retrieval),
+        }
     }
 }
 
@@ -225,6 +268,7 @@ impl Tool for GoalTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: false,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -254,7 +298,7 @@ impl Tool for GoalTool {
                 "invalid tool input: field 'action' must be one of 'create', 'revise', 'resolve', 'focus', 'tree' (got '{other}')"
             ),
         };
-        Ok(ToolResult::Json { value: response })
+        Ok(ToolResult::json(response))
     }
 }
 
@@ -282,6 +326,10 @@ impl GoalTool {
         // The Goal Model owns intent derivation; derive a signature from the
         // hypothesis so the node carries a full four-field IntentSignature.
         let intent = derive_intent(&intent_input_for(hypothesis))?;
+
+        // Retain a copy of the derived intent for the advisory seam only when it
+        // is wired (Requirement 5.1); off mode clones nothing.
+        let advisory_intent = self.retrieval.as_ref().map(|_| intent.clone());
 
         // Drive the store BEFORE mutating the active-goal stack: if the store
         // rejects the create (empty hypothesis, missing parent, OCC conflict, or
@@ -314,10 +362,23 @@ impl GoalTool {
         stack.lock().push(id.clone());
 
         let active = stack.lock().active().cloned();
-        Ok(json!({
+        let mut response = json!({
             "id": id,
             "active": active,
-        }))
+        });
+
+        // Fold the advisory in ONLY when the seam is wired (Requirement 5.1,
+        // 5.3). Off mode (`retrieval == None`) leaves `response` untouched, so
+        // the result is byte-identical to today with no `advisory` key
+        // (Requirement 1.3). The advisory is injected additively and NEVER acted
+        // upon (Requirement 5.4); an empty advisory renders empty arrays
+        // (Requirement 5.5).
+        if let (Some(retrieval), Some(intent)) = (&self.retrieval, &advisory_intent) {
+            let advisory = retrieval.retrieve_advisory(intent).await;
+            response["advisory"] = render_advisory(&advisory);
+        }
+
+        Ok(response)
     }
 
     /// `revise`: append a `GoalNodeRevised` for an existing node (Requirement 7.2).
@@ -455,6 +516,60 @@ fn intent_input_for(hypothesis: &str) -> IntentInput {
     IntentInput::new("goal", "goal", hypothesis, "session")
 }
 
+/// Render an [`AdvisorySummary`] into the agent-facing JSON shape folded into the
+/// `create` result (Requirement 5.3).
+///
+/// Produces `{ "applicable_memories": [...], "similar_goals": [...] }`. An empty
+/// advisory renders both as empty arrays (Requirement 5.5). Each memory renders
+/// its structured intent, plan step descriptions, kind, and re-rank score —
+/// **never** the raw cached-answer value (Requirement 5.4). Each similar goal
+/// renders its `{ did, concluded, dead_end }` summary.
+fn render_advisory(advisory: &AdvisorySummary) -> Value {
+    let applicable_memories: Vec<Value> =
+        advisory.memories.iter().map(render_scored_memory).collect();
+    let similar_goals: Vec<Value> = advisory.summaries.iter().map(render_goal_summary).collect();
+    json!({
+        "applicable_memories": applicable_memories,
+        "similar_goals": similar_goals,
+    })
+}
+
+/// Render one scored memory as its intent, plan step descriptions, kind, and
+/// score. The raw cached answer value is deliberately omitted (Requirement 5.4).
+fn render_scored_memory(scored: &ScoredMemory) -> Value {
+    let memory = &scored.memory;
+    let plan_steps: Vec<&str> = memory
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.description.as_str())
+        .collect();
+    json!({
+        "intent": memory.intent,
+        "kind": memory_kind_label(memory.kind),
+        "plan_steps": plan_steps,
+        "score": scored.score,
+    })
+}
+
+/// Render one similar-goal summary as `{ did, concluded, dead_end }`.
+fn render_goal_summary(summary: &GoalSummary) -> Value {
+    json!({
+        "did": summary.did,
+        "concluded": summary.concluded,
+        "dead_end": summary.dead_end,
+    })
+}
+
+/// A stable lowercase label for a [`MemoryKind`].
+fn memory_kind_label(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Fragment => "fragment",
+        MemoryKind::Composite => "composite",
+        MemoryKind::Negative => "negative",
+    }
+}
+
 /// Parse a non-`Open` resolution string. `resolve` requires a terminal
 /// resolution; `open` (or any unknown value) is rejected.
 fn parse_resolution(value: &str) -> anyhow::Result<Resolution> {
@@ -501,6 +616,7 @@ mod tests {
     use halter_goals::{
         ClosureOutcome, EventLogGoalStore, GoalNode, InMemoryGoalEventLog, IntentSignature,
     };
+    use halter_protocol::ToolResultKind;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
@@ -616,8 +732,8 @@ mod tests {
     }
 
     fn json_value(result: ToolResult) -> Value {
-        match result {
-            ToolResult::Json { value } => value,
+        match result.kind {
+            ToolResultKind::Json { value } => value,
             other => panic!("expected json result, got {other:?}"),
         }
     }
@@ -1120,5 +1236,181 @@ mod tests {
         );
         // The active node is unchanged: close() failed before resolve_to_parent.
         assert_eq!(active_node(&context), Some(seeded));
+    }
+
+    // --- Task 10.4: the GoalRetrieval advisory seam -----------------------
+
+    use halter_goals::tier2::{
+        EvidenceContract, GoalSummary, Memory, MemoryKind, MemoryVersion, OutcomeShape, PlanStep,
+        Provenance, Reinforcement,
+    };
+    use halter_goals::tier2::memory::{Applicability, ParameterSchema, Plan};
+    use halter_goals::{
+        AdvisorySummary, MemoryId, OutcomeRef, ScoredMemory, Sha256, SubtreeHash,
+    };
+
+    /// A fake [`GoalRetrieval`] that returns a fixed [`AdvisorySummary`].
+    struct FakeRetrieval {
+        advisory: AdvisorySummary,
+    }
+
+    #[async_trait]
+    impl GoalRetrieval for FakeRetrieval {
+        async fn retrieve_advisory(&self, _intent: &IntentSignature) -> AdvisorySummary {
+            self.advisory.clone()
+        }
+    }
+
+    /// Build a minimal `Memory` carrying the given intent, kind, and plan step
+    /// descriptions for advisory-rendering assertions.
+    fn sample_memory(kind: MemoryKind, steps: &[&str]) -> Memory {
+        Memory {
+            id: MemoryId::from("mem-advisory"),
+            kind,
+            intent: IntentSignature {
+                intent_type: halter_goals::IntentType::from("lookup"),
+                target_type: halter_goals::TargetType::from("file"),
+                target_ref: halter_goals::TargetRef::from("src/lib.rs"),
+                scope: halter_goals::Scope::from("repo"),
+            },
+            parameter_schema: ParameterSchema::default(),
+            applicability: Applicability::unconstrained(),
+            plan: Plan {
+                steps: steps
+                    .iter()
+                    .map(|d| PlanStep {
+                        description: (*d).to_owned(),
+                        tool: None,
+                        intent: None,
+                    })
+                    .collect(),
+            },
+            evidence_contract: EvidenceContract::default(),
+            outcome_shape: OutcomeShape {
+                result_ref: OutcomeRef::from("outcome://1"),
+                schema: "s".to_owned(),
+            },
+            cached_outcome: None,
+            provenance: Provenance::default(),
+            reinforcement: Reinforcement::default(),
+            version: MemoryVersion(SubtreeHash(Sha256::from("h"))),
+        }
+    }
+
+    fn goal_tool_with_retrieval(advisory: AdvisorySummary) -> GoalTool {
+        let store = Arc::new(EventLogGoalStore::new(InMemoryGoalEventLog::new()));
+        GoalTool::with_retrieval(store, Arc::new(FakeRetrieval { advisory }))
+    }
+
+    #[tokio::test]
+    async fn off_mode_create_result_has_no_advisory_key() {
+        // `GoalTool::new` (no retrieval seam) must emit today's byte-identical
+        // shape: exactly `{ id, active }` with no `advisory` key (Requirement
+        // 1.3).
+        let tool = goal_tool();
+        let context = tool_context(Arc::new(ToolSessionStore::default()));
+
+        let created = json_value(
+            tool.execute(
+                context,
+                json!({ "action": "create", "hypothesis": "off-mode goal" }),
+            )
+            .await
+            .expect("create"),
+        );
+
+        assert!(created.get("id").is_some(), "id must be present");
+        assert!(created.get("active").is_some(), "active must be present");
+        assert!(
+            created.get("advisory").is_none(),
+            "off mode must not fold in an advisory key: {created:?}"
+        );
+        let object = created.as_object().expect("create result is an object");
+        assert_eq!(
+            object.len(),
+            2,
+            "off-mode create result must be exactly {{ id, active }}: {created:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_retrieval_folds_empty_advisory_arrays() {
+        // An empty advisory renders empty arrays for both keys (Requirement 5.5).
+        let tool = goal_tool_with_retrieval(AdvisorySummary::empty());
+        let context = tool_context(Arc::new(ToolSessionStore::default()));
+
+        let created = json_value(
+            tool.execute(
+                context,
+                json!({ "action": "create", "hypothesis": "advisory goal" }),
+            )
+            .await
+            .expect("create"),
+        );
+
+        let advisory = &created["advisory"];
+        assert_eq!(
+            advisory["applicable_memories"],
+            json!([]),
+            "empty advisory renders empty applicable_memories: {created:?}"
+        );
+        assert_eq!(
+            advisory["similar_goals"],
+            json!([]),
+            "empty advisory renders empty similar_goals: {created:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_retrieval_folds_non_empty_advisory() {
+        // A non-empty advisory folds the memories + summaries into the two
+        // arrays, rendering intent / plan steps / kind / score and the goal
+        // summary fields (Requirement 5.3).
+        let memory = sample_memory(MemoryKind::Negative, &["inspect parser", "run tests"]);
+        let advisory = AdvisorySummary {
+            memories: vec![ScoredMemory {
+                memory,
+                score: 0.75,
+            }],
+            summaries: vec![GoalSummary {
+                did: "looked up the parser".to_owned(),
+                concluded: "found the off-by-one".to_owned(),
+                dead_end: false,
+            }],
+        };
+        let tool = goal_tool_with_retrieval(advisory);
+        let context = tool_context(Arc::new(ToolSessionStore::default()));
+
+        let created = json_value(
+            tool.execute(
+                context,
+                json!({ "action": "create", "hypothesis": "advisory goal" }),
+            )
+            .await
+            .expect("create"),
+        );
+
+        let memories = created["advisory"]["applicable_memories"]
+            .as_array()
+            .expect("applicable_memories is an array");
+        assert_eq!(memories.len(), 1, "one memory folded in: {created:?}");
+        let mem = &memories[0];
+        assert_eq!(mem["kind"], "negative");
+        assert_eq!(mem["score"], json!(0.75));
+        assert_eq!(mem["plan_steps"], json!(["inspect parser", "run tests"]));
+        assert_eq!(mem["intent"]["intent_type"], "lookup");
+        // The raw cached-answer value is never rendered (Requirement 5.4).
+        assert!(
+            mem.get("cached_outcome").is_none() && mem.get("cached_answer").is_none(),
+            "advisory must not leak the cached answer: {created:?}"
+        );
+
+        let goals = created["advisory"]["similar_goals"]
+            .as_array()
+            .expect("similar_goals is an array");
+        assert_eq!(goals.len(), 1, "one summary folded in: {created:?}");
+        assert_eq!(goals[0]["did"], "looked up the parser");
+        assert_eq!(goals[0]["concluded"], "found the off-by-one");
+        assert_eq!(goals[0]["dead_end"], false);
     }
 }

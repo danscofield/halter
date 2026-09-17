@@ -190,15 +190,13 @@ impl Tool for ProfilingTool {
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(30.0);
         let profile = get_work_profile_for_session(last_seconds, Some(&context.session_id.0));
-        Ok(ToolResult::Json {
-            value: json!({
-                "folded": profile.folded,
-                "summary": profile.summary,
-                "svg": profile.svg,
-                "total_ms": profile.total_ms,
-                "sample_count": profile.sample_count,
-            }),
-        })
+        Ok(ToolResult::json(json!({
+            "folded": profile.folded,
+            "summary": profile.summary,
+            "svg": profile.svg,
+            "total_ms": profile.total_ms,
+            "sample_count": profile.sample_count,
+        })))
     }
 }
 

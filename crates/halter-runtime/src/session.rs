@@ -16,7 +16,7 @@ use halter_protocol::{
     PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
     SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
     StreamEvent, SubagentEventForwarding, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome,
-    ToolResult, ToolResultMessage, Turn, TurnId, Usage, Volatility,
+    ToolResult, ToolResultKind, ToolResultMessage, Turn, TurnId, Usage, Volatility,
 };
 use halter_providers::{ModelRegistry, Provider};
 
@@ -34,7 +34,7 @@ use tracing::{debug, error, info, warn};
 use crate::model_selection::select_models;
 use crate::turn_registry::TurnRegistry;
 use crate::active_goal::{ActiveGoalStack, GoalAttributionMode, stamp_goal_node};
-use halter_goals::{GoalStore, GoalStoreError};
+use halter_goals::{EmbeddingSource, GoalStore, GoalStoreError, MemoryStore};
 use crate::{
     CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
     ContextSettings, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
@@ -64,6 +64,65 @@ const AUTOMATIC_COMPACTION_TRIGGER: &str = "auto";
 pub struct SessionHookEntry {
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) guard: Weak<EvictionGuard>,
+}
+
+/// The Memory_Store backend the Tier 2 retrieval path was constructed over.
+///
+/// A small, non-secret indicator mirroring `[sessions].backend`. It lives here
+/// (rather than depending on `halter_config::SessionBackend`) so `halter-runtime`
+/// needs no `halter-config` dependency — the same reasoning behind the local
+/// [`GoalAttributionMode`] mirror. The builder translates the config backend into
+/// this value when populating [`Tier2Services`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBackend {
+    /// In-memory memory store (`InMemoryMemoryStore`).
+    Memory,
+    /// SQLite-backed memory store (`SqliteMemoryStore`).
+    Sqlite,
+}
+
+/// The non-secret bundle of Tier 2 retrieval-path components the builder wires
+/// into the runtime under `goal_tracking = auto` (Req 11.3).
+///
+/// This carries only non-secret handles and flags: the shared [`MemoryStore`],
+/// the query-path [`EmbeddingSource`] (whose credential is confined to a
+/// redacting `SecretString` inside the source itself), whether embedding is
+/// enabled, and the selected memory-store backend. It deliberately holds **no**
+/// credential/secret field — the embedding bearer never surfaces here (Req 11.2,
+/// 11.3).
+///
+/// `None` on [`RuntimeServices::tier2`] in `off` mode; `Some(..)` under `auto`
+/// (populated by the builder in task 15.2).
+#[derive(Clone)]
+pub struct Tier2Services {
+    /// The shared memory store used by retrieval and induction.
+    ///
+    /// `MemoryStore` itself is a plain synchronous trait (no `Send + Sync`
+    /// supertrait — it is a sync interior-mutability API), so the shared handle
+    /// spells out `+ Send + Sync` explicitly, since `RuntimeServices` is shared
+    /// across turn tasks and threads.
+    pub memory_store: Arc<dyn MemoryStore + Send + Sync>,
+    /// The query-path embedding source (returns `None` when disabled / no
+    /// credential, degrading retrieval to structured-head-only).
+    pub embedding_source: Arc<dyn EmbeddingSource>,
+    /// Whether the embedding path is enabled (`[embedding].enabled` and a usable
+    /// credential resolved). When `false`, retrieval runs structured-head-only.
+    pub embedding_enabled: bool,
+    /// The selected memory-store backend (non-secret indicator).
+    pub memory_backend: MemoryBackend,
+}
+
+impl std::fmt::Debug for Tier2Services {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the underlying store/source (which may transitively hold a
+        // credential) — expose only the non-secret shape (Req 11.2/11.3).
+        f.debug_struct("Tier2Services")
+            .field("memory_store", &"<dyn MemoryStore>")
+            .field("embedding_source", &"<dyn EmbeddingSource>")
+            .field("embedding_enabled", &self.embedding_enabled)
+            .field("memory_backend", &self.memory_backend)
+            .finish()
+    }
 }
 
 /// Shared dependencies used by session handles and spawned turn tasks.
@@ -104,6 +163,11 @@ pub struct RuntimeServices {
     /// its attribution context over when `goal_tracking = Auto`. `None` in
     /// `off` mode, so no attribution is installed.
     pub goal_store: Option<Arc<dyn GoalStore>>,
+    /// The non-secret Tier 2 retrieval-path bundle (Req 11.3). `Some(..)` under
+    /// `goal_tracking = auto` (populated by the builder), `None` under `off`.
+    /// The builder emits the Req 12.3 diagnostic when `auto` + embedding
+    /// disabled. Holds no credential/secret field.
+    pub tier2: Option<Tier2Services>,
 }
 
 #[derive(Debug, Clone)]
@@ -2199,7 +2263,7 @@ impl SessionHandle {
                     let message = Message::Tool(ToolResultMessage {
                         id: MessageId::new(),
                         call_id: call.id.clone(),
-                        content: ToolResult::Empty,
+                        content: ToolResult::empty(),
                         error: Some(error),
                         created_at: Utc::now(),
                     });
@@ -2300,7 +2364,7 @@ impl SessionHandle {
                             error = %error,
                             "tool call failed"
                         );
-                        (ToolResult::Empty, Some(ToolError::new(error.to_string())))
+                        (ToolResult::empty(), Some(ToolError::new(error.to_string())))
                     }
                 };
                 if error.is_none() {
@@ -3280,10 +3344,10 @@ fn ensure_provider_iteration_allowed(
 }
 
 fn tool_result_kind(result: &ToolResult) -> &'static str {
-    match result {
-        ToolResult::Empty => "empty",
-        ToolResult::Text { .. } => "text",
-        ToolResult::Json { .. } => "json",
+    match result.kind {
+        ToolResultKind::Empty => "empty",
+        ToolResultKind::Text { .. } => "text",
+        ToolResultKind::Json { .. } => "json",
     }
 }
 
@@ -3340,9 +3404,9 @@ fn hash_text(text: &str) -> ContentHash {
 
 fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
     match value {
-        serde_json::Value::Null => ToolResult::Empty,
-        serde_json::Value::String(text) => ToolResult::Text { text },
-        other => ToolResult::Json { value: other },
+        serde_json::Value::Null => ToolResult::empty(),
+        serde_json::Value::String(text) => ToolResult::text(text),
+        other => ToolResult::json(other),
     }
 }
 
@@ -3840,6 +3904,7 @@ impl Default for RuntimeServices {
             trace_recorder: None,
             goal_tracking: GoalAttributionMode::Off,
             goal_store: None,
+            tier2: None,
         }
     }
 }
@@ -3859,7 +3924,7 @@ mod tests {
         ApiKind, BlockId, HookHandlerType, HookRunStatus, HookSessionStartSource, Message, ModelId,
         ModelRole, PluginId, ProviderCapabilities, ProviderError, ProviderKind, ProviderName,
         ProviderRequest, ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities,
-        ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn,
+        ToolConcurrency, ToolName, ToolResult, ToolResultKind, ToolSpec, Turn,
     };
     use halter_providers::{FakeProvider, Provider};
     use halter_tools::{
@@ -5093,8 +5158,8 @@ mod tests {
             )
             .await
             .expect("create subgoal");
-        let subgoal = match created {
-            ToolResult::Json { value } => GoalNodeId::from(
+        let subgoal = match created.kind {
+            ToolResultKind::Json { value } => GoalNodeId::from(
                 value["id"].as_str().expect("subgoal id").to_owned(),
             ),
             other => panic!("unexpected tool result: {other:?}"),
@@ -8199,7 +8264,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(windows["items"].as_array().unwrap().len(), 2);
-                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome, .. } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(ToolResult::Json { value }) if value["items"].as_array().unwrap().len() == 2))));
+                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome, .. } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(ToolResult { kind: ToolResultKind::Json { value }, .. }) if value["items"].as_array().unwrap().len() == 2))));
                 let resumed = runtime.resume(session.session_id()).await.unwrap().unwrap();
                 assert!(
                     search
@@ -9395,12 +9460,12 @@ mod tests {
 
     fn latest_spawn_agent_id(messages: &[Message]) -> Option<String> {
         messages.iter().rev().find_map(|message| match message {
-            Message::Tool(tool) => match &tool.content {
-                ToolResult::Json { value } => value
+            Message::Tool(tool) => match &tool.content.kind {
+                ToolResultKind::Json { value } => value
                     .get("agent_id")
                     .and_then(serde_json::Value::as_str)
                     .map(ToOwned::to_owned),
-                ToolResult::Empty | ToolResult::Text { .. } => None,
+                ToolResultKind::Empty | ToolResultKind::Text { .. } => None,
             },
             Message::System(_) | Message::User(_) | Message::Assistant(_) => None,
         })
@@ -9411,7 +9476,7 @@ mod tests {
             matches!(
                 message,
                 Message::Tool(tool)
-                    if matches!(&tool.content, ToolResult::Json { value } if value.get("timed_out").is_some())
+                    if matches!(&tool.content.kind, ToolResultKind::Json { value } if value.get("timed_out").is_some())
             )
         })
     }
@@ -10166,9 +10231,7 @@ mod tests {
             _input: serde_json::Value,
         ) -> anyhow::Result<ToolResult> {
             *self.executions.lock().expect("executions") += 1;
-            Ok(ToolResult::Json {
-                value: json!({ "ok": true }),
-            })
+            Ok(ToolResult::json(json!({ "ok": true })))
         }
     }
 
@@ -10273,7 +10336,7 @@ mod tests {
             _input: serde_json::Value,
         ) -> anyhow::Result<ToolResult> {
             self.barrier.wait().await;
-            Ok(ToolResult::Empty)
+            Ok(ToolResult::empty())
         }
     }
 
@@ -10378,6 +10441,7 @@ mod tests {
                     requires_approval: false,
                     cancellable: false,
                     long_running: true,
+                    ..Default::default()
                 },
                 provider_aliases: Default::default(),
             }
@@ -10393,9 +10457,7 @@ mod tests {
                 chunk: "streamed chunk".to_owned(),
             });
             tokio::time::sleep(Duration::from_millis(300)).await;
-            Ok(ToolResult::Json {
-                value: json!({ "ok": true }),
-            })
+            Ok(ToolResult::json(json!({ "ok": true })))
         }
     }
 

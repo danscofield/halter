@@ -55,6 +55,7 @@ impl Tool for BrowserTool {
                 requires_approval: false,
                 cancellable: true,
                 long_running: true,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -80,7 +81,7 @@ impl Tool for BrowserTool {
             "close" => action_close(&context).await?,
             other => anyhow::bail!("failed to execute browser tool: unknown action '{other}'"),
         };
-        Ok(ToolResult::Json { value })
+        Ok(ToolResult::json(value))
     }
 }
 

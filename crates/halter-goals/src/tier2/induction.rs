@@ -55,11 +55,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use halter_providers::{
+    EmbeddingClient, EmbeddingClientError, EmbeddingRequest, EmbeddingResponse,
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::goal_model::{GoalNode, Resolution};
-use crate::tier2::memory::{Memory, MemoryKind};
+use crate::tier2::embedding::settings::ResolvedEmbeddingSettings;
+use crate::tier2::embedding::{insert_memory_with_writer, MemoryEmbeddingWriter};
+use crate::tier2::memory::{
+    Applicability, EvidenceContract, Memory, MemoryKind, MemoryVersion, OutcomeShape,
+    ParameterSchema, Plan, PlanStep, Provenance, Reinforcement,
+};
 use crate::tier2::store::MemoryStore;
-use crate::types::{GoalNodeId, IntentSignature, MemoryId, SubtreeHash};
+use crate::types::{GoalNodeId, IntentSignature, MemoryId, OutcomeRef, SubtreeHash};
 
 // ---------------------------------------------------------------------------
 // Recurrence tracking (Requirement 14)
@@ -459,6 +468,38 @@ impl KeyLocks {
 }
 
 // ---------------------------------------------------------------------------
+// Disabled-writer embedding client (backward-compat for `new`)
+// ---------------------------------------------------------------------------
+
+/// A zero-sized [`EmbeddingClient`] whose [`embed_once`](EmbeddingClient::embed_once)
+/// is never reached.
+///
+/// It backs [`InductionEngine::new`]'s backward-compatible disabled-writer
+/// path: `new` builds a [`MemoryEmbeddingWriter`] over this client from a
+/// disabled, credential-less [`ResolvedEmbeddingSettings`], so the writer
+/// short-circuits every `embed_for_write` to `Unavailable` *before* any client
+/// call — induced memories store an empty embedding exactly as they did before
+/// the write path was wired in (Req 6.4, 10.4). The transport is therefore
+/// dead code; it returns a retryable [`EmbeddingClientError::Transport`] rather
+/// than panicking so the type stays a total, panic-free `EmbeddingClient` even
+/// if some future path reached it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEmbeddingClient;
+
+#[async_trait]
+impl EmbeddingClient for NoEmbeddingClient {
+    async fn embed_once(
+        &self,
+        _request: &EmbeddingRequest,
+        _cancel: CancellationToken,
+    ) -> Result<EmbeddingResponse, EmbeddingClientError> {
+        // Never reached: the disabled writer degrades to `Unavailable` before
+        // any client call. Degrade rather than panic if ever reached.
+        Err(EmbeddingClientError::Transport)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
 
@@ -468,7 +509,7 @@ impl KeyLocks {
 /// See the module docs for the algorithm. The engine is generic over the store
 /// so it composes with any [`MemoryStore`]; Judge/Author/tracker are
 /// trait objects so callers can supply model-backed or test implementations.
-pub struct InductionEngine<S: MemoryStore> {
+pub struct InductionEngine<S: MemoryStore, C: EmbeddingClient> {
     store: Arc<S>,
     tracker: Arc<dyn RecurrenceTracker>,
     judge: Arc<dyn Judge>,
@@ -476,10 +517,29 @@ pub struct InductionEngine<S: MemoryStore> {
     threshold: u64,
     log: InductionLog,
     key_locks: Arc<KeyLocks>,
+    /// The write-path embedding producer. The single non-dedup insert routes
+    /// through [`insert_memory_with_writer`] so induced memories store real
+    /// embeddings (Req 6.1, 6.2), degrading to an empty embedding when the
+    /// backend is unavailable/disabled (Req 6.3).
+    writer: MemoryEmbeddingWriter<C>,
+    /// The query-path source's configured dimension, passed to
+    /// [`insert_memory_with_writer`] so the writer/source dimension-consistency
+    /// check runs before each insert (Req 8.2).
+    source_dimension: Option<u32>,
 }
 
-impl<S: MemoryStore> InductionEngine<S> {
-    /// Build an engine with the given collaborators and recurrence threshold `N`.
+impl<S: MemoryStore> InductionEngine<S, NoEmbeddingClient> {
+    /// Build an engine on the backward-compatible **disabled-writer** path
+    /// (unchanged params).
+    ///
+    /// This is the drop-in replacement for the original `new`: it constructs a
+    /// [`MemoryEmbeddingWriter`] over a zero-sized [`NoEmbeddingClient`] from a
+    /// disabled, credential-less [`ResolvedEmbeddingSettings`], with
+    /// `source_dimension = None`. Because the writer is disabled, its
+    /// `embed_for_write` short-circuits to `Unavailable` with no network call,
+    /// so induced memories store an empty embedding exactly as they did before
+    /// the write path was wired in (Req 6.4, 10.4). Callers that want real
+    /// write-time embeddings use [`InductionEngine::with_writer`] instead.
     #[must_use]
     pub fn new(
         store: Arc<S>,
@@ -487,6 +547,27 @@ impl<S: MemoryStore> InductionEngine<S> {
         judge: Arc<dyn Judge>,
         author: Arc<dyn Author>,
         threshold: u64,
+    ) -> Self {
+        let writer =
+            MemoryEmbeddingWriter::new(NoEmbeddingClient, ResolvedEmbeddingSettings::disabled());
+        Self::with_writer(store, tracker, judge, author, threshold, writer, None)
+    }
+}
+
+impl<S: MemoryStore, C: EmbeddingClient> InductionEngine<S, C> {
+    /// Build an engine that inserts through [`insert_memory_with_writer`] using
+    /// the given write-path `writer` and query-path `source_dimension`
+    /// (Req 6, 8). This is the runtime path; embeddings are produced async,
+    /// outside the store lock, and handed to the synchronous insert (Req 9).
+    #[must_use]
+    pub fn with_writer(
+        store: Arc<S>,
+        tracker: Arc<dyn RecurrenceTracker>,
+        judge: Arc<dyn Judge>,
+        author: Arc<dyn Author>,
+        threshold: u64,
+        writer: MemoryEmbeddingWriter<C>,
+        source_dimension: Option<u32>,
     ) -> Self {
         Self {
             store,
@@ -496,6 +577,8 @@ impl<S: MemoryStore> InductionEngine<S> {
             threshold,
             log: InductionLog::new(),
             key_locks: Arc::new(KeyLocks::new()),
+            writer,
+            source_dimension,
         }
     }
 
@@ -599,8 +682,20 @@ impl<S: MemoryStore> InductionEngine<S> {
             };
         }
 
-        // Otherwise insert under the idempotency key.
-        match self.store.insert(key, candidate) {
+        // Otherwise insert under the idempotency key, routing through the
+        // writer so the memory stores a real embedding. The embedding is
+        // produced async, UP FRONT and OUTSIDE the store lock, then handed to
+        // the synchronous `insert_with_embedding` (Req 6.1, 6.2, 8.2, 9.1,
+        // 9.2). `source_dimension` drives the writer/source consistency check.
+        match insert_memory_with_writer(
+            &self.writer,
+            self.source_dimension,
+            self.store.as_ref(),
+            key,
+            candidate,
+        )
+        .await
+        {
             Ok(id) => InductionOutcome::Inserted(id),
             Err(err) => InductionOutcome::AuthorFailed(err.to_string()),
         }
@@ -637,7 +732,157 @@ impl<S: MemoryStore> InductionEngine<S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic, agent-data-backed Judge + Author (runtime production path)
+// ---------------------------------------------------------------------------
 
+/// The runtime [`Judge`] that decides worth from the agent-supplied resolution
+/// alone — no model call.
+///
+/// The agent already supplies structured goal data (its [`IntentSignature`],
+/// hypothesis, and resolution conditions) at create/resolve time, and that data
+/// flows into induction through [`CleanContext`]/[`DistilledNode`]. A goal the
+/// agent *solved* is worth remembering, so this Judge approves at
+/// [`Granularity::Fragment`] exactly when the node's resolution is
+/// [`Resolution::Accepted`], and declines otherwise (a rejected or inconclusive
+/// goal is not authored). The decision is fully deterministic and reads only the
+/// distilled node.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GoalResolutionJudge;
+
+impl GoalResolutionJudge {
+    /// Create the Judge. Stateless.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Judge for GoalResolutionJudge {
+    async fn evaluate(&self, ctx: &CleanContext) -> JudgeVerdict {
+        match ctx.node().resolution {
+            Resolution::Accepted => JudgeVerdict::approve(
+                Granularity::Fragment,
+                "goal resolved as accepted; the solved procedure is worth remembering",
+            ),
+            Resolution::Rejected => {
+                JudgeVerdict::decline("goal was rejected; a rejected goal is not authored")
+            }
+            Resolution::Inconclusive => JudgeVerdict::decline(
+                "goal was inconclusive; an inconclusive goal is not authored",
+            ),
+            Resolution::Open => {
+                JudgeVerdict::decline("goal is still open; an open goal is not authored")
+            }
+        }
+    }
+}
+
+/// The runtime [`Author`] that builds a [`Memory`] deterministically from the
+/// agent-supplied node data — no model call, no served answer.
+///
+/// It authors a minimal, valid [`MemoryKind::Fragment`] from the
+/// [`DistilledNode`]: the node's [`IntentSignature`] becomes the memory intent,
+/// the [`Applicability`] guard requires the same `intent_type`, and the [`Plan`]
+/// steps are derived from the node's `hypothesis` and each of its
+/// `resolution_conditions`. `cached_outcome` is left `None` — this feature
+/// serves no cached answers — and the remaining bookkeeping fields take their
+/// defaults. The memory `version` and a stable [`MemoryId`] are derived from the
+/// node's `subtree_hash` (falling back to the node id when the hash carries no
+/// content); authoring fails cleanly only when no stable version key can be
+/// derived (a closed node with no `subtree_hash`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GoalResolutionAuthor;
+
+impl GoalResolutionAuthor {
+    /// Create the Author. Stateless.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Author for GoalResolutionAuthor {
+    async fn write(
+        &self,
+        granularity: Granularity,
+        ctx: &CleanContext,
+    ) -> Result<Memory, AuthorError> {
+        let node = ctx.node();
+
+        // A stable version key is required. A closed node always carries a
+        // `subtree_hash`; if it is somehow absent we cannot version the memory,
+        // so fail cleanly (the engine records the failure and inserts nothing).
+        let subtree_hash = node.subtree_hash.clone().ok_or_else(|| {
+            AuthorError::new("cannot author a memory: resolved node has no subtree_hash")
+        })?;
+
+        // Author only the granularity the Judge approved. This deterministic
+        // Author approves solved goals as `Fragment`s; any other granularity is
+        // not something this Author knows how to write.
+        if granularity != Granularity::Fragment {
+            return Err(AuthorError::new(format!(
+                "unsupported granularity {granularity:?}; this author writes fragments only"
+            )));
+        }
+
+        // A stable id derived from the subtree hash keeps re-authoring the same
+        // subtree idempotent at the id level; the node id disambiguates.
+        let memory_id = MemoryId::from(format!("mem-{}-{}", node.id, subtree_hash));
+
+        // Derive plan steps from the agent-supplied hypothesis and resolution
+        // conditions. The hypothesis is the leading step (what the goal tested);
+        // each resolution condition follows (the conditions under which it
+        // resolved). Skip empty descriptions so the plan carries only content.
+        let mut steps: Vec<PlanStep> = Vec::new();
+        if !node.hypothesis.trim().is_empty() {
+            steps.push(PlanStep {
+                description: node.hypothesis.clone(),
+                tool: None,
+                intent: None,
+            });
+        }
+        for condition in &node.resolution_conditions {
+            if condition.trim().is_empty() {
+                continue;
+            }
+            steps.push(PlanStep {
+                description: condition.clone(),
+                tool: None,
+                intent: None,
+            });
+        }
+
+        let intent = node.intent.clone();
+        let applicability = Applicability {
+            required_intent_type: Some(intent.intent_type.clone()),
+            ..Applicability::default()
+        };
+
+        Ok(Memory {
+            id: memory_id,
+            kind: MemoryKind::Fragment,
+            intent,
+            parameter_schema: ParameterSchema::default(),
+            applicability,
+            plan: Plan { steps },
+            evidence_contract: EvidenceContract::default(),
+            outcome_shape: OutcomeShape {
+                result_ref: OutcomeRef::from(format!("outcome://{}", node.id)),
+                schema: String::new(),
+            },
+            // This feature serves no cached answers.
+            cached_outcome: None,
+            provenance: Provenance {
+                origins: vec![(node.id.clone(), subtree_hash.clone())],
+            },
+            reinforcement: Reinforcement::default(),
+            version: MemoryVersion(subtree_hash),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -843,7 +1088,7 @@ mod tests {
         judge: Arc<dyn Judge>,
         author: Arc<dyn Author>,
         n: u64,
-    ) -> InductionEngine<InMemoryMemoryStore> {
+    ) -> InductionEngine<InMemoryMemoryStore, NoEmbeddingClient> {
         InductionEngine::new(store, tracker, judge, author, n)
     }
 

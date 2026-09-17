@@ -153,9 +153,7 @@ impl Tool for ReadTool {
             result.insert("lines".to_owned(), json!(lines));
         }
 
-        Ok(ToolResult::Json {
-            value: Value::Object(result),
-        })
+        Ok(ToolResult::json(Value::Object(result)))
     }
 }
 
@@ -248,6 +246,7 @@ mod tests {
         DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolPolicy,
         ToolSessionStore,
     };
+    use halter_protocol::ToolResultKind;
 
     use super::*;
 
@@ -318,7 +317,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), 4),
                 json!({
@@ -329,6 +328,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -342,7 +342,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -354,6 +354,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -373,7 +374,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -385,6 +386,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -399,7 +401,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -410,6 +412,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -425,7 +428,7 @@ mod tests {
             .collect::<String>();
         std::fs::write(temp.path().join("note.txt"), text).expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -437,6 +440,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -460,7 +464,7 @@ mod tests {
             .collect::<String>();
         std::fs::write(temp.path().join("note.txt"), text).expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -470,6 +474,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -485,7 +490,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\n").expect("write");
 
-        let ToolResult::Json { value: enabled } = ReadTool
+        let ToolResultKind::Json { value: enabled } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -495,17 +500,19 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
 
-        let ToolResult::Json { value: disabled } = ReadTool
+        let ToolResultKind::Json { value: disabled } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({ "path": "note.txt" }),
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -518,7 +525,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -528,6 +535,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };
@@ -543,7 +551,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "1\n2\n3\n4\n5\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResultKind::Json { value } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -555,6 +563,7 @@ mod tests {
             )
             .await
             .expect("read succeeds")
+            .kind
         else {
             panic!("expected json result");
         };

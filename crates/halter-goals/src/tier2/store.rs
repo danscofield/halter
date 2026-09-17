@@ -75,6 +75,79 @@ pub enum MemoryStoreError {
         "unsound pinnable tokens: a SoundPinnable answer must depend only on pinnable ContentHash tokens"
     )]
     UnsoundPinnableTokens,
+
+    /// A write-time embedding was produced whose length does not equal the
+    /// configured embedding dimension (Requirement 9.5).
+    ///
+    /// The write path rejects the store rather than persist a
+    /// mismatched-length embedding that would corrupt ANN cosine ranking,
+    /// leaving any previously stored embedding for the memory unchanged. Carries
+    /// only the integer dimensions — never any credential, URL, or response
+    /// body text (Req 5.6).
+    #[error(
+        "embedding dimension mismatch: produced vector length {actual} \
+         != configured dimension {configured}"
+    )]
+    EmbeddingDimensionMismatch {
+        /// The produced vector's length.
+        actual: usize,
+        /// The configured embedding dimension the vector was required to match.
+        configured: u32,
+    },
+
+    /// The write-time embedding dimension configured for the writer does not
+    /// equal the dimension configured for the query-path source (Requirement
+    /// 9.6).
+    ///
+    /// This is a configuration fault: the two paths must share one dimension so
+    /// stored and query embeddings are comparable. The write path rejects the
+    /// store rather than persist an embedding produced under a divergent
+    /// dimension, leaving any previously stored embedding unchanged. Carries
+    /// only the integer dimensions (Req 5.6).
+    ///
+    /// The source's dimension field is named `source_dimension` rather than
+    /// `source`: `thiserror`'s derive unconditionally treats a field literally
+    /// named `source` as the error's [`std::error::Error::source`] and requires
+    /// its type to implement [`std::error::Error`], which a `u32` does not
+    /// ([`thiserror` issue #138](https://github.com/dtolnay/thiserror/issues/138)).
+    /// Naming it `source_dimension` keeps the derive while carrying the same
+    /// value the design's `source` field does.
+    #[error(
+        "embedding dimension misconfigured: writer dimension {writer} \
+         != source dimension {source_dimension}"
+    )]
+    EmbeddingDimensionMisconfigured {
+        /// The writer's configured dimension.
+        writer: u32,
+        /// The source's configured dimension.
+        source_dimension: u32,
+    },
+}
+
+impl From<crate::tier2::embedding::EmbeddingWriteError> for MemoryStoreError {
+    /// Map a write-path embedding failure onto its store-level counterpart so
+    /// the write-path caller can reject the store with a single error type
+    /// (Req 9.5, 9.6).
+    ///
+    /// `DimensionMismatch` (a per-request length fault) maps to
+    /// [`MemoryStoreError::EmbeddingDimensionMismatch`], and
+    /// `DimensionMisconfigured` (a writer-vs-source configuration fault) maps to
+    /// [`MemoryStoreError::EmbeddingDimensionMisconfigured`], carrying the same
+    /// integer dimensions forward.
+    fn from(error: crate::tier2::embedding::EmbeddingWriteError) -> Self {
+        use crate::tier2::embedding::EmbeddingWriteError as WriteError;
+        match error {
+            WriteError::DimensionMismatch { actual, configured } => {
+                Self::EmbeddingDimensionMismatch { actual, configured }
+            }
+            WriteError::DimensionMisconfigured { writer, source } => {
+                Self::EmbeddingDimensionMisconfigured {
+                    writer,
+                    source_dimension: source,
+                }
+            }
+        }
+    }
 }
 
 /// Validate a memory against the Tier 2 write-time rules.
@@ -156,10 +229,45 @@ pub trait MemoryStore {
     ///
     /// Full dedup/idempotency on the key is handled separately (task 12.3); this
     /// method validates and stores.
+    ///
+    /// This forwards to [`Self::insert_with_embedding`] with an empty
+    /// [`Embedding`], preserving the pre-embedding behavior for every caller
+    /// that does not (yet) produce a write-time embedding. The write path that
+    /// integrates [`crate::tier2::embedding::MemoryEmbeddingWriter`] calls
+    /// [`Self::insert_with_embedding`] directly with the produced embedding.
     fn insert(
         &self,
         key: (GoalNodeId, SubtreeHash),
         mem: Memory,
+    ) -> Result<MemoryId, MemoryStoreError> {
+        self.insert_with_embedding(key, mem, Embedding::default())
+    }
+
+    /// Validate and store `mem` under `(node_id, subtree_hash)`, persisting the
+    /// caller-supplied `embedding` in the record's embedding slot.
+    ///
+    /// The embedding is produced by the write path **async, up front, outside
+    /// this synchronous store lock** (see
+    /// [`crate::tier2::embedding::MemoryEmbeddingWriter`]) and passed in here, so
+    /// the store never awaits while holding its lock. A backend-unavailable
+    /// write passes [`Embedding::default`] (empty) and still succeeds (Req 6.4);
+    /// a usable embedding of the configured dimension is passed through and
+    /// stored (Req 9.2). Any dimension failure is rejected by the caller
+    /// *before* calling this method, so a rejected store never mutates the
+    /// existing record (Req 9.5, 9.6).
+    ///
+    /// On success the memory is retrievable via [`Self::filter`] /
+    /// [`Self::ann_recall`] and its [`MemoryId`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MemoryStoreError`] when `mem` violates a write-time rule (see
+    /// [`validate_memory`]); in that case nothing is persisted.
+    fn insert_with_embedding(
+        &self,
+        key: (GoalNodeId, SubtreeHash),
+        mem: Memory,
+        embedding: Embedding,
     ) -> Result<MemoryId, MemoryStoreError>;
 
     /// Reinforce the memory identified by `id` using a fresh `candidate`.
@@ -215,6 +323,50 @@ pub trait MemoryStore {
     fn find_duplicate(&self, intent: &IntentSignature, plan: &Plan) -> Option<MemoryId>;
 }
 
+/// Forward [`MemoryStore`] through a shared trait object.
+///
+/// The runtime shares one memory store between the (generic, `Sized`)
+/// [`crate::InductionEngine`] and the type-erased retrieval/advisory path. The
+/// engine's `S: MemoryStore` bound is `Sized`, so it cannot take `dyn
+/// MemoryStore` directly; this blanket impl lets a single
+/// `Arc<dyn MemoryStore + Send + Sync>` satisfy that bound while remaining a
+/// trait object elsewhere. Every method simply delegates to the inner store,
+/// so both paths observe exactly the same records.
+impl MemoryStore for std::sync::Arc<dyn MemoryStore + Send + Sync> {
+    fn insert_with_embedding(
+        &self,
+        key: (GoalNodeId, SubtreeHash),
+        mem: Memory,
+        embedding: Embedding,
+    ) -> Result<MemoryId, MemoryStoreError> {
+        (**self).insert_with_embedding(key, mem, embedding)
+    }
+
+    fn reinforce(
+        &self,
+        id: &MemoryId,
+        candidate: Memory,
+    ) -> Result<MemoryId, MemoryStoreError> {
+        (**self).reinforce(id, candidate)
+    }
+
+    fn filter(&self, sig: &IntentSignature) -> Vec<Memory> {
+        (**self).filter(sig)
+    }
+
+    fn ann_recall(&self, embedding: &Embedding, limit: usize) -> Vec<Memory> {
+        (**self).ann_recall(embedding, limit)
+    }
+
+    fn has_memory_for(&self, key: &(GoalNodeId, SubtreeHash)) -> Option<MemoryId> {
+        (**self).has_memory_for(key)
+    }
+
+    fn find_duplicate(&self, intent: &IntentSignature, plan: &Plan) -> Option<MemoryId> {
+        (**self).find_duplicate(intent, plan)
+    }
+}
+
 /// An in-memory, thread-safe [`MemoryStore`].
 ///
 /// Storage is a [`RwLock`]-guarded map from [`MemoryId`] to [`MemoryRecord`].
@@ -239,16 +391,19 @@ impl InMemoryMemoryStore {
         }
     }
 
-    /// Build a [`MemoryRecord`] from a validated `mem`, its key, and timestamps.
+    /// Build a [`MemoryRecord`] from a validated `mem`, its key, timestamps, and
+    /// the caller-supplied `embedding`.
     ///
     /// The indexed fields mirror `mem.intent`/`mem.kind` for the structured
-    /// filter; `embedding` defaults to empty (populated by later indexing tasks).
+    /// filter; `embedding` is the write-time embedding produced up front by the
+    /// caller (empty when the backend was unavailable, Req 6.4).
     fn record_from(
         mem: Memory,
         node_id: GoalNodeId,
         subtree_hash: SubtreeHash,
         created_at: Timestamp,
         updated_at: Timestamp,
+        embedding: Embedding,
     ) -> MemoryRecord {
         MemoryRecord {
             id: mem.id.clone(),
@@ -257,7 +412,7 @@ impl InMemoryMemoryStore {
             target_ref: mem.intent.target_ref.clone(),
             scope: mem.intent.scope.clone(),
             kind: mem.kind,
-            embedding: Embedding::default(),
+            embedding,
             body: mem,
             node_id,
             subtree_hash,
@@ -297,10 +452,11 @@ pub(crate) fn cosine_distance(a: &Embedding, b: &Embedding) -> f32 {
 }
 
 impl MemoryStore for InMemoryMemoryStore {
-    fn insert(
+    fn insert_with_embedding(
         &self,
         key: (GoalNodeId, SubtreeHash),
         mem: Memory,
+        embedding: Embedding,
     ) -> Result<MemoryId, MemoryStoreError> {
         // Validate before touching stored state so a rejected write leaves the
         // store unchanged (Requirements 17.x, 22.x).
@@ -310,7 +466,7 @@ impl MemoryStore for InMemoryMemoryStore {
         let id = mem.id.clone();
         // Deterministic timestamp: created == updated at insert time.
         let now = Timestamp::default();
-        let record = Self::record_from(mem, node_id, subtree_hash, now, now);
+        let record = Self::record_from(mem, node_id, subtree_hash, now, now, embedding);
 
         let mut guard = self
             .records
@@ -359,8 +515,17 @@ impl MemoryStore for InMemoryMemoryStore {
                 let subtree_hash = candidate.version.0.clone();
                 let new_id = candidate.id.clone();
                 let now = Timestamp::default();
-                let record =
-                    Self::record_from(candidate, node_id, subtree_hash, now, now);
+                // Reinforce of an absent id is a first observation; it carries
+                // no write-time embedding, so store an empty one (matching the
+                // pre-embedding behavior).
+                let record = Self::record_from(
+                    candidate,
+                    node_id,
+                    subtree_hash,
+                    now,
+                    now,
+                    Embedding::default(),
+                );
                 guard.insert(new_id.clone(), record);
                 Ok(new_id)
             }

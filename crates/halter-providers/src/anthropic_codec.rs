@@ -1174,9 +1174,7 @@ mod tests {
             Message::Tool(ToolResultMessage {
                 id: MessageId::new(),
                 call_id: ToolCallId::from("call with spaces"),
-                content: halter_protocol::ToolResult::Text {
-                    text: "done".to_owned(),
-                },
+                content: halter_protocol::ToolResult::text("done"),
                 error: None,
                 created_at: Utc::now(),
             }),
@@ -1625,9 +1623,7 @@ mod tests {
             Message::Tool(ToolResultMessage {
                 id: MessageId::new(),
                 call_id: ToolCallId::from("toolu_123"),
-                content: ToolResult::Text {
-                    text: "README contents".to_owned(),
-                },
+                content: ToolResult::text("README contents"),
                 error: None,
                 created_at: Utc::now(),
             }),

@@ -37,6 +37,8 @@
 //! tail recall is skipped and the structured-head-only candidate set is returned
 //! *without error*.
 
+use async_trait::async_trait;
+
 use crate::tier2::memory::{Embedding, Memory};
 use crate::tier2::store::MemoryStore;
 use crate::types::IntentSignature;
@@ -75,20 +77,33 @@ pub struct ScoredMemory {
 /// backend produced an embedding, and `None` when the backend is unavailable
 /// (down). A `None` result drives the graceful degradation to a
 /// structured-head-only result (Requirement 18.7) rather than an error.
-pub trait EmbeddingSource {
+///
+/// The trait is `async` (`#[async_trait]`) so a concrete backend (for example
+/// the OpenAI embeddings API) can be awaited at the single embed call site
+/// without changing the retrieval algorithm or its head/tail bounds
+/// (Requirements 1.1, 1.4). The `Send + Sync` bound lets an `EmbeddingSource`
+/// be held across the `.await` in retrieval.
+#[async_trait]
+pub trait EmbeddingSource: Send + Sync {
     /// Embed the query signature, or `None` if the backend is unavailable.
-    fn embed(&self, sig: &IntentSignature) -> Option<Embedding>;
+    async fn embed(&self, sig: &IntentSignature) -> Option<Embedding>;
 }
 
 /// Structured-first retrieval over a [`MemoryStore`].
 ///
 /// Implementors surface the applicable memories for `sig`, structured-first,
 /// ordered by cheap re-rank score (Requirement 18).
+///
+/// The trait is `async` (`#[async_trait]`) because retrieval now awaits the
+/// single [`EmbeddingSource::embed`] call when the structured head is thin
+/// (Requirement 1.4). The structured `filter`/`ann_recall` store reads remain
+/// synchronous.
+#[async_trait]
 pub trait Retrieval {
     /// Retrieve the memories applicable to `sig`, ordered by score descending.
     ///
     /// See the module docs for the full algorithm and the requirement mapping.
-    fn retrieve_memories(&self, sig: &IntentSignature) -> Vec<ScoredMemory>;
+    async fn retrieve_memories(&self, sig: &IntentSignature) -> Vec<ScoredMemory>;
 }
 
 /// Count how many of the four [`IntentSignature`] fields of `mem`'s intent
@@ -132,14 +147,14 @@ pub fn cheap_score(mem: &Memory, sig: &IntentSignature) -> f32 {
 /// default to [`HEAD_MIN`] / [`TAIL_LIMIT`] but are configurable via
 /// [`Self::with_bounds`].
 #[derive(Debug)]
-pub struct MemoryRetrieval<'a, S: MemoryStore, E: EmbeddingSource> {
+pub struct MemoryRetrieval<'a, S: MemoryStore + ?Sized, E: EmbeddingSource + ?Sized> {
     store: &'a S,
     embedder: &'a E,
     head_min: usize,
     tail_limit: usize,
 }
 
-impl<'a, S: MemoryStore, E: EmbeddingSource> MemoryRetrieval<'a, S, E> {
+impl<'a, S: MemoryStore + ?Sized, E: EmbeddingSource + ?Sized> MemoryRetrieval<'a, S, E> {
     /// Create a retrieval over `store` and `embedder` with default bounds
     /// ([`HEAD_MIN`], [`TAIL_LIMIT`]).
     #[must_use]
@@ -164,8 +179,11 @@ impl<'a, S: MemoryStore, E: EmbeddingSource> MemoryRetrieval<'a, S, E> {
     }
 }
 
-impl<S: MemoryStore, E: EmbeddingSource> Retrieval for MemoryRetrieval<'_, S, E> {
-    fn retrieve_memories(&self, sig: &IntentSignature) -> Vec<ScoredMemory> {
+#[async_trait]
+impl<S: MemoryStore + Sync + ?Sized, E: EmbeddingSource + ?Sized> Retrieval
+    for MemoryRetrieval<'_, S, E>
+{
+    async fn retrieve_memories(&self, sig: &IntentSignature) -> Vec<ScoredMemory> {
         // 1. Structured filter first (primary). `filter` applies each memory's
         //    applicability guard, so the head is assembled over all four
         //    signature fields before any embedding recall (Requirement 18.1).
@@ -177,7 +195,7 @@ impl<S: MemoryStore, E: EmbeddingSource> Retrieval for MemoryRetrieval<'_, S, E>
         //    try the backend; if it is available we recall up to TAIL_LIMIT and
         //    take the deduplicated union, else we degrade to head-only (18.7).
         let candidates: Vec<Memory> = if head.len() < self.head_min {
-            match self.embedder.embed(sig) {
+            match self.embedder.embed(sig).await {
                 Some(embedding) => {
                     let tail = self.store.ann_recall(&embedding, self.tail_limit);
                     dedupe_union(head, tail)
@@ -241,7 +259,7 @@ mod tests {
         GoalNodeId, IntentType, MemoryId, OutcomeRef, Scope, Sha256, SubtreeHash, TargetRef,
         TargetType,
     };
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sig() -> IntentSignature {
         IntentSignature {
@@ -285,41 +303,51 @@ mod tests {
     /// An embedding source that is always available and records call count.
     struct SpyEmbedder {
         embedding: Embedding,
-        calls: Cell<usize>,
+        calls: AtomicUsize,
     }
     impl SpyEmbedder {
         fn available() -> Self {
             Self {
                 embedding: Embedding(vec![0.1, 0.2, 0.3]),
-                calls: Cell::new(0),
+                calls: AtomicUsize::new(0),
             }
         }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
     }
+    #[async_trait]
     impl EmbeddingSource for SpyEmbedder {
-        fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
-            self.calls.set(self.calls.get() + 1);
+        async fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Some(self.embedding.clone())
         }
     }
 
     /// An embedding source modeling a down backend: always `None`.
     struct DownEmbedder {
-        calls: Cell<usize>,
+        calls: AtomicUsize,
     }
     impl DownEmbedder {
         fn new() -> Self {
-            Self { calls: Cell::new(0) }
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
         }
     }
+    #[async_trait]
     impl EmbeddingSource for DownEmbedder {
-        fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
-            self.calls.set(self.calls.get() + 1);
+        async fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             None
         }
     }
 
-    #[test]
-    fn structured_head_used_without_embedding_when_head_not_thin() {
+    #[tokio::test]
+    async fn structured_head_used_without_embedding_when_head_not_thin() {
         // HEAD_MIN candidates in the head -> not thin -> no embedding recall.
         let store = InMemoryMemoryStore::new();
         for i in 0..HEAD_MIN {
@@ -328,18 +356,18 @@ mod tests {
         let embedder = SpyEmbedder::available();
         let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let results = retrieval.retrieve_memories(&sig());
+        let results = retrieval.retrieve_memories(&sig()).await;
 
         assert_eq!(results.len(), HEAD_MIN, "the head is the candidate set");
         assert_eq!(
-            embedder.calls.get(),
+            embedder.calls(),
             0,
             "embedding recall must not be invoked when the head is not thin"
         );
     }
 
-    #[test]
-    fn thin_head_invokes_embedding_recall_and_dedupes_union_by_id() {
+    #[tokio::test]
+    async fn thin_head_invokes_embedding_recall_and_dedupes_union_by_id() {
         // One structured-head memory (< HEAD_MIN) -> thin -> tail recall runs.
         // "shared" is applicable (matches sig) so it appears in BOTH head and
         // tail; it must appear exactly once in the result.
@@ -352,9 +380,9 @@ mod tests {
         let embedder = SpyEmbedder::available();
         let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let results = retrieval.retrieve_memories(&sig());
+        let results = retrieval.retrieve_memories(&sig()).await;
 
-        assert_eq!(embedder.calls.get(), 1, "thin head must invoke embedding recall");
+        assert_eq!(embedder.calls(), 1, "thin head must invoke embedding recall");
         let shared_count = results
             .iter()
             .filter(|s| s.memory.id == MemoryId::from("shared"))
@@ -368,8 +396,8 @@ mod tests {
         assert!(ids.contains(&MemoryId::from("tail-only")));
     }
 
-    #[test]
-    fn tail_candidate_failing_applicability_is_excluded() {
+    #[tokio::test]
+    async fn tail_candidate_failing_applicability_is_excluded() {
         // Head is thin (empty). The store holds a memory whose applicability
         // guard is NOT satisfied by sig; ann_recall may surface it, but the
         // defensive applicability filter must exclude it (Requirement 18.4).
@@ -384,7 +412,7 @@ mod tests {
         let embedder = SpyEmbedder::available();
         let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let results = retrieval.retrieve_memories(&sig());
+        let results = retrieval.retrieve_memories(&sig()).await;
 
         assert!(
             results.is_empty(),
@@ -392,8 +420,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn results_ordered_by_score_descending_full_match_outranks_weaker() {
+    #[tokio::test]
+    async fn results_ordered_by_score_descending_full_match_outranks_weaker() {
         // A full four-field structured match must outrank a weaker match.
         // Use a thin head so both are surfaced, then check ordering.
         let store = InMemoryMemoryStore::new();
@@ -412,7 +440,7 @@ mod tests {
         let embedder = SpyEmbedder::available();
         let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let results = retrieval.retrieve_memories(&sig());
+        let results = retrieval.retrieve_memories(&sig()).await;
 
         assert_eq!(results.len(), 2);
         assert_eq!(
@@ -428,8 +456,8 @@ mod tests {
         assert_eq!(results[1].score, 3.0);
     }
 
-    #[test]
-    fn backend_down_degrades_to_head_only_without_error() {
+    #[tokio::test]
+    async fn backend_down_degrades_to_head_only_without_error() {
         // Thin head + down backend -> head-only, no panic/error (Requirement 18.7).
         let store = InMemoryMemoryStore::new();
         insert(&store, memory_with("head", sig())).unwrap();
@@ -437,15 +465,15 @@ mod tests {
         let embedder = DownEmbedder::new();
         let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let results = retrieval.retrieve_memories(&sig());
+        let results = retrieval.retrieve_memories(&sig()).await;
 
-        assert_eq!(embedder.calls.get(), 1, "the backend was consulted");
+        assert_eq!(embedder.calls(), 1, "the backend was consulted");
         assert_eq!(results.len(), 1, "structured head is returned");
         assert_eq!(results[0].memory.id, MemoryId::from("head"));
     }
 
-    #[test]
-    fn tail_recall_bound_by_tail_limit() {
+    #[tokio::test]
+    async fn tail_recall_bound_by_tail_limit() {
         // Many memories, thin head trigger (head_min large so head is "thin"),
         // small tail_limit -> at most tail_limit distinct candidates surface via
         // the union (all applicable, all in head AND tail since filter returns
@@ -466,7 +494,7 @@ mod tests {
         // Retrieval still returns the deduped union; head already holds all 8
         // applicable memories, so the union is 8, but the tail request was
         // bounded to 2 (verified above). This documents TAIL_LIMIT is honored.
-        let results = retrieval.retrieve_memories(&sig());
+        let results = retrieval.retrieve_memories(&sig()).await;
         assert_eq!(results.len(), 8, "head union is complete; tail was bounded");
     }
 }

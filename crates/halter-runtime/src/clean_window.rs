@@ -162,9 +162,7 @@ impl Tool for NewContextTool {
             input.as_object().is_some_and(|object| object.is_empty()),
             "new_context takes an empty object"
         );
-        Ok(ToolResult::Text {
-            text: "Context rollover requested.".to_owned(),
-        })
+        Ok(ToolResult::text("Context rollover requested."))
     }
 }
 

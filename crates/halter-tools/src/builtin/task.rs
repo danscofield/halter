@@ -174,6 +174,7 @@ impl Tool for TaskTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: false,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -192,7 +193,7 @@ impl Tool for TaskTool {
                 "invalid tool input: field 'action' must be one of 'create', 'list', 'complete' (got '{other}')"
             ),
         };
-        Ok(ToolResult::Json { value: response })
+        Ok(ToolResult::json(response))
     }
 }
 
@@ -238,6 +239,7 @@ fn complete_action(store: &Arc<Mutex<TaskList>>, input: &Value) -> anyhow::Resul
 mod tests {
     use std::sync::Arc;
 
+    use halter_protocol::ToolResultKind;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
@@ -265,8 +267,8 @@ mod tests {
     }
 
     fn json_value(result: ToolResult) -> Value {
-        match result {
-            ToolResult::Json { value } => value,
+        match result.kind {
+            ToolResultKind::Json { value } => value,
             other => panic!("expected json result, got {other:?}"),
         }
     }

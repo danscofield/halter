@@ -59,8 +59,13 @@ impl SummaryProvider {
     ///   retrieval order (Requirements 11.1, 11.2, 11.3).
     /// - Never mutates any persisted record (Requirement 14.3): it only reads
     ///   the compact [`Memory`] values retrieval already returned.
+    ///
+    /// This method is `async` because [`Retrieval::retrieve_memories`] now
+    /// awaits the embedding backend when the structured head is thin
+    /// (Requirements 1.4, 6.3); the disabled path still returns without
+    /// awaiting retrieval at all.
     #[must_use]
-    pub fn summaries_for(
+    pub async fn summaries_for(
         &self,
         sig: &IntentSignature,
         retrieval: &impl Retrieval,
@@ -73,7 +78,7 @@ impl SummaryProvider {
         // Enabled: retrieval already returns candidates ordered by score,
         // structured-head-first (Requirements 11.1, 11.2). Map them in order,
         // bounding to `max_summaries` when set (Requirement 11.3).
-        let candidates = retrieval.retrieve_memories(sig);
+        let candidates = retrieval.retrieve_memories(sig).await;
         let mut summaries: Vec<GoalSummary> = candidates
             .iter()
             .map(|scored| summarize(&scored.memory))
@@ -174,8 +179,9 @@ mod tests {
         CanonicalJson, GoalNodeId, IntentType, MemoryId, OutcomeRef, Scope, Sha256, SubtreeHash,
         TargetRef, TargetType, Timestamp, ToolName, ValidityToken,
     };
+    use async_trait::async_trait;
     use proptest::prelude::*;
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // ----- Retrieval spy -----------------------------------------------------
 
@@ -186,21 +192,26 @@ mod tests {
     /// assert that retrieval was never consulted.
     struct SpyRetrieval {
         candidates: Vec<ScoredMemory>,
-        called: Cell<bool>,
+        called: AtomicBool,
     }
 
     impl SpyRetrieval {
         fn new(candidates: Vec<ScoredMemory>) -> Self {
             Self {
                 candidates,
-                called: Cell::new(false),
+                called: AtomicBool::new(false),
             }
+        }
+
+        fn called(&self) -> bool {
+            self.called.load(Ordering::SeqCst)
         }
     }
 
+    #[async_trait]
     impl Retrieval for SpyRetrieval {
-        fn retrieve_memories(&self, _sig: &IntentSignature) -> Vec<ScoredMemory> {
-            self.called.set(true);
+        async fn retrieve_memories(&self, _sig: &IntentSignature) -> Vec<ScoredMemory> {
+            self.called.store(true, Ordering::SeqCst);
             self.candidates.clone()
         }
     }
@@ -323,7 +334,8 @@ mod tests {
                 max_summaries: max,
             });
 
-            let summaries = provider.summaries_for(&sig(), &retrieval);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let summaries = rt.block_on(provider.summaries_for(&sig(), &retrieval));
 
             // Count bound: at most `max` when set, else all candidates.
             let expected_len = match max {
@@ -367,11 +379,12 @@ mod tests {
                 max_summaries: max,
             });
 
-            let summaries = provider.summaries_for(&sig(), &retrieval);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let summaries = rt.block_on(provider.summaries_for(&sig(), &retrieval));
 
             prop_assert!(summaries.is_empty(), "a disabled provider yields no summaries");
             prop_assert!(
-                !retrieval.called.get(),
+                !retrieval.called(),
                 "a disabled provider must not invoke Retrieval"
             );
         }
@@ -458,7 +471,8 @@ mod tests {
                 enabled: true,
                 max_summaries: None,
             });
-            let via_provider = provider.summaries_for(&sig(), &retrieval);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let via_provider = rt.block_on(provider.summaries_for(&sig(), &retrieval));
 
             for summary in std::iter::once(&direct).chain(via_provider.iter()) {
                 // Negative -> dead-end flagged with dead-end phrasing (12.3).
@@ -502,8 +516,8 @@ mod tests {
         assert!(!summary.concluded.contains("EVIDENCE-XYZ12"));
     }
 
-    #[test]
-    fn enabled_provider_bounds_and_orders_candidates() {
+    #[tokio::test]
+    async fn enabled_provider_bounds_and_orders_candidates() {
         // Requirement 11.3: an enabled provider with max_summaries = 2 over three
         // candidates returns two summaries, in retrieval order.
         let candidates = vec![
@@ -517,7 +531,7 @@ mod tests {
             max_summaries: Some(2),
         });
 
-        let summaries = provider.summaries_for(&sig(), &retrieval);
+        let summaries = provider.summaries_for(&sig(), &retrieval).await;
 
         assert_eq!(summaries.len(), 2, "bounded to max_summaries");
         assert!(
@@ -532,19 +546,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disabled_provider_returns_no_summaries() {
+    #[tokio::test]
+    async fn disabled_provider_returns_no_summaries() {
         // Requirement 13.1: a disabled provider returns none and never consults
         // retrieval.
         let candidates = vec![scored(memory_with_marker("mem-0", "ref-only"), 1.0)];
         let retrieval = SpyRetrieval::new(candidates);
         let provider = SummaryProvider::new(SummaryConfig::default());
 
-        let summaries = provider.summaries_for(&sig(), &retrieval);
+        let summaries = provider.summaries_for(&sig(), &retrieval).await;
 
         assert!(summaries.is_empty(), "a disabled provider yields no summaries");
         assert!(
-            !retrieval.called.get(),
+            !retrieval.called(),
             "a disabled provider does not invoke retrieval"
         );
     }

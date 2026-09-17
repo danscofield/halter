@@ -485,12 +485,12 @@ impl<N: NotesBackend> Tool for NotesTool<N> {
     }
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
         anyhow::ensure!(!context.cancel.is_cancelled(), "notes operation cancelled");
-        Ok(ToolResult::Json {
-            value: self
+        Ok(ToolResult::json(
+            self
                 .0
                 .execute(&context.session_id, serde_json::from_value(input)?)
                 .await?,
-        })
+        ))
     }
 }
 

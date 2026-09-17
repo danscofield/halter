@@ -5,6 +5,7 @@
 // pattern: Functional Core
 
 mod builtin;
+mod cache;
 mod notes;
 mod policy;
 mod runtime;
@@ -22,8 +23,10 @@ pub use builtin::ProfilingTool;
 #[cfg(feature = "pty")]
 pub use builtin::PtyTool;
 pub use builtin::fs_lock::PathLockMap;
+pub use cache::{CacheKey, DEFAULT_MEMORY_STORE_CAPACITY, InMemoryToolResultStore, ToolResultStore};
 pub use builtin::{
-    EditTool, GlobTool, GoalStack, GoalStackStore, GoalTool, GrepTool, InMemoryGoalStackStore,
+    EditTool, GlobTool, GoalRetrieval, GoalStack, GoalStackStore, GoalTool, GrepTool,
+    InMemoryGoalStackStore,
     InMemoryTaskStore, ProcessTool, ReadTool, ShellTool, Task, TaskList, TaskStatus, TaskStore,
     TaskSummary, TaskTool, WriteTool, register_builtin_tools,
 };

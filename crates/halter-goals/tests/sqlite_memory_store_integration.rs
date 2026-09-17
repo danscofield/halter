@@ -54,8 +54,9 @@ impl halter_goals::tier2::EvidenceValidator for AlwaysFreshValidator {
 /// A minimal always-available embedder returning a fixed embedding.
 struct FixedEmbedder;
 
+#[async_trait::async_trait]
 impl EmbeddingSource for FixedEmbedder {
-    fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
+    async fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
         Some(Embedding(vec![0.1, 0.2, 0.3]))
     }
 }
@@ -125,8 +126,8 @@ fn applicable_memory(id: &str) -> Memory {
 /// `InMemoryMemoryStore` would be wired, and run the UNCHANGED `start_goal`.
 /// Because retrieval finds the applicable memory, `start_goal` returns
 /// `GoalStart::Replay(..)` (a hit drives `decide_replay`).
-#[test]
-fn sqlite_store_is_drop_in_for_start_goal() {
+#[tokio::test]
+async fn sqlite_store_is_drop_in_for_start_goal() {
     // SqliteMemoryStore used through the same `&self` MemoryStore contract.
     let store = SqliteMemoryStore::open_in_memory().expect("open in-memory sqlite store");
     store
@@ -145,7 +146,8 @@ fn sqlite_store_is_drop_in_for_start_goal() {
         &validator,
         &DenyAllModeB,
         Timestamp(0),
-    );
+    )
+    .await;
 
     // A retrieval hit must drive decide_replay -> GoalStart::Replay(..).
     match start {
@@ -187,8 +189,8 @@ fn unique_temp_db_path() -> std::path::PathBuf {
 ///       inputs (summaries are additive — Requirements 14.1, 14.2), and
 ///   (b) summaries are attached (non-empty when candidates exist).
 /// The temp file is removed at the end.
-#[test]
-fn reopen_then_start_goal_with_summaries_is_additive() {
+#[tokio::test]
+async fn reopen_then_start_goal_with_summaries_is_additive() {
     let path = unique_temp_db_path();
 
     // --- 1. Insert into a file-backed store, then close it by dropping. -----
@@ -226,7 +228,8 @@ fn reopen_then_start_goal_with_summaries_is_additive() {
         &validator,
         &DenyAllModeB,
         Timestamp(0),
-    );
+    )
+    .await;
 
     // Summaries ENABLED with a bound.
     let provider = SummaryProvider::new(SummaryConfig {
@@ -240,7 +243,8 @@ fn reopen_then_start_goal_with_summaries_is_additive() {
         &DenyAllModeB,
         Timestamp(0),
         &provider,
-    );
+    )
+    .await;
 
     // (a) Additive: the replay decision is identical to start_goal's.
     assert_eq!(

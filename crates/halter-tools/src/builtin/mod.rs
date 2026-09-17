@@ -32,7 +32,7 @@ pub use ast::AstGrepTool;
 pub use browser::BrowserTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
-pub use goal::{GoalStack, GoalStackStore, GoalTool, InMemoryGoalStackStore};
+pub use goal::{GoalRetrieval, GoalStack, GoalStackStore, GoalTool, InMemoryGoalStackStore};
 pub use grep::GrepTool;
 #[cfg(feature = "image-tools")]
 pub use image::ImageTool;
@@ -165,7 +165,7 @@ mod tests {
             .await
             .expect("read file");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResultKind::Json { value } = result.kind else {
             panic!("expected json result");
         };
         assert_eq!(value["content"], "hello");
@@ -245,7 +245,7 @@ mod tests {
             .await
             .expect("glob should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResultKind::Json { value } = result.kind else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -279,7 +279,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResultKind::Json { value } = result.kind else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -304,7 +304,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResultKind::Json { value } = result.kind else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -339,7 +339,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResultKind::Json { value } = result.kind else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -367,7 +367,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResultKind::Json { value } = result.kind else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");

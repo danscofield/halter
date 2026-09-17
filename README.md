@@ -199,7 +199,7 @@ impl Tool for EchoTool {
     }
 
     async fn execute(&self, _context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
-        Ok(ToolResult::Json { value: input })
+        Ok(ToolResult::json(input))
     }
 }
 

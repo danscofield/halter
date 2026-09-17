@@ -3,7 +3,7 @@
 use base64::Engine;
 use halter_protocol::{
     AssistantMessage, AssistantPart, Message, ProviderKind, ProviderRequest, ToolCallId, ToolError,
-    ToolName, ToolResult, ToolSpec, UserMessage, UserPart,
+    ToolName, ToolResult, ToolResultKind, ToolSpec, UserMessage, UserPart,
 };
 use sha2::{Digest, Sha256};
 
@@ -101,20 +101,20 @@ pub(crate) fn canonical_tool_name(
 }
 
 pub(crate) fn tool_result_text(result: &ToolResult, error: &Option<ToolError>) -> String {
-    match (result, error) {
-        (_, Some(error)) if matches!(result, ToolResult::Empty) => error.message.clone(),
-        (ToolResult::Text { text }, Some(error)) => {
+    match (&result.kind, error) {
+        (_, Some(error)) if matches!(result.kind, ToolResultKind::Empty) => error.message.clone(),
+        (ToolResultKind::Text { text }, Some(error)) => {
             format!("{text}\n\nerror: {}", error.message)
         }
-        (ToolResult::Json { value }, Some(error)) => serde_json::json!({
+        (ToolResultKind::Json { value }, Some(error)) => serde_json::json!({
             "result": value,
             "error": error.message,
         })
         .to_string(),
-        (ToolResult::Empty, None) => String::new(),
-        (ToolResult::Text { text }, None) => text.clone(),
-        (ToolResult::Json { value }, None) => value.to_string(),
-        (ToolResult::Empty, Some(error)) => error.message.clone(),
+        (ToolResultKind::Empty, None) => String::new(),
+        (ToolResultKind::Text { text }, None) => text.clone(),
+        (ToolResultKind::Json { value }, None) => value.to_string(),
+        (ToolResultKind::Empty, Some(error)) => error.message.clone(),
     }
 }
 

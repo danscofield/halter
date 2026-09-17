@@ -100,7 +100,7 @@ fn session_event_payload_variants_have_stable_kind() {
     };
     let outcome = ToolExecutionOutcome {
         call: call.clone(),
-        result: Ok(ToolResult::Empty),
+        result: Ok(ToolResult::empty()),
     };
     let hook_run = HookRunSummary {
         run_id: "run-1".to_owned(),

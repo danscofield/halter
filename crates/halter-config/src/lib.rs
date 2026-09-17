@@ -22,19 +22,23 @@ pub use resources::{
 };
 pub use schema::{
     COMPACTION_HEADROOM_TOKENS, CompactionStrategyKind, ConfiguredProvider, ContextConfig,
-    DEFAULT_MODEL_ID, DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS, DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS,
+    DEFAULT_EMBEDDING_CACHE_MAX_ENTRIES, DEFAULT_EMBEDDING_MAX_ATTEMPTS, DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_TIMEOUT_SECS, DEFAULT_MODEL_ID, DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS,
+    DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS,
     DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS, DEFAULT_PROVIDER_RETRY_DEADLINE_SECS,
     DEFAULT_PROVIDER_RETRY_JITTER_PCT, DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS,
     DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS, DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS,
-    GoalTrackingMode, HarnessConfig, LoopbackAllowConfig, ModelConfig, ModelJudgeConfig,
+    DEFAULT_TOOL_CACHE_TTL_SECS,
+    EmbeddingConfig, GoalTrackingMode, HarnessConfig, LoopbackAllowConfig, ModelConfig,
+    ModelJudgeConfig,
     ModelJudgeMode, ModelSlot,
     ModelSlotRef, ModelsConfig, NetworkPolicyConfig, OpenAiOAuthConfig, PolicyConfig,
     PromptsConfig, ProviderConfig, ProvidersConfig, RequestRetryConfig, RequestRetryOverrideConfig,
     ResilienceConfig, ResilienceOverrideConfig, ResilienceTimeoutsConfig,
     ResilienceTimeoutsOverrideConfig, ResolvedProviderAuth, ResolvedProviderConfig,
     ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SearchRoots, SessionBackend,
-    SessionsConfig, ShellModeConfig, ShellPolicyConfig, SystemPromptPreset, ToolsConfig,
-    resolve_provider_runtime_config,
+    SessionsConfig, ShellModeConfig, ShellPolicyConfig, SystemPromptPreset, ToolCacheBackend,
+    ToolsConfig, resolve_provider_runtime_config,
 };
 
 #[cfg(feature = "remote-plugins")]

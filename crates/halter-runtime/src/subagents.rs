@@ -1225,6 +1225,7 @@ mod tests {
             trace_recorder: None,
             goal_tracking: crate::GoalAttributionMode::Off,
             goal_store: None,
+            tier2: None,
         })
     }
 

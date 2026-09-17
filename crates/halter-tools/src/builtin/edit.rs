@@ -44,6 +44,7 @@ impl Tool for EditTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: false,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -123,15 +124,13 @@ impl Tool for EditTool {
 
         let occurrences_in_file = result.0;
         let replacements_applied = if replace_all { occurrences_in_file } else { 1 };
-        Ok(ToolResult::Json {
-            value: json!({
-                "path": canonical_path,
-                "occurrences_in_file": occurrences_in_file,
-                "replacements_applied": replacements_applied,
-                "file_hash_before": result.1,
-                "file_hash_after": result.2,
-            }),
-        })
+        Ok(ToolResult::json(json!({
+            "path": canonical_path,
+            "occurrences_in_file": occurrences_in_file,
+            "replacements_applied": replacements_applied,
+            "file_hash_before": result.1,
+            "file_hash_after": result.2,
+        })))
     }
 }
 
@@ -143,6 +142,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolPolicy};
+    use halter_protocol::ToolResultKind;
 
     use super::*;
 
@@ -171,7 +171,7 @@ mod tests {
         std::fs::write(&path, "hello world").expect("write");
         let expected_sha256 = hash_text("hello world");
 
-        let ToolResult::Json { value } = EditTool
+        let ToolResultKind::Json { value } = EditTool
             .execute(
                 tool_context(temp.path()),
                 json!({
@@ -183,6 +183,7 @@ mod tests {
             )
             .await
             .expect("edit succeeds")
+            .kind
         else {
             panic!("expected json result");
         };

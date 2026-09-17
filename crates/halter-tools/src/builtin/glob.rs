@@ -115,12 +115,10 @@ impl Tool for GlobTool {
             }
         }
 
-        Ok(ToolResult::Json {
-            value: json!({
-                "matches": matches,
-                "total_matches": matches.len(),
-            }),
-        })
+        Ok(ToolResult::json(json!({
+            "matches": matches,
+            "total_matches": matches.len(),
+        })))
     }
 }
 

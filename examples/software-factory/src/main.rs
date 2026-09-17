@@ -26,7 +26,7 @@ use halter_config::{
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
     ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency, ToolName, ToolResult,
-    ToolSpec, Turn, Usage, Volatility,
+    ToolResultKind, ToolSpec, Turn, Usage, Volatility,
 };
 use halter_tools::{Tool, ToolContext};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -1118,6 +1118,7 @@ fn default_factory_config() -> HarnessConfig {
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
+            ..Default::default()
         },
         policy: PolicyConfig {
             allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter")],
@@ -1301,6 +1302,7 @@ impl Tool for GitHubIssueTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: true,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -1309,12 +1311,10 @@ impl Tool for GitHubIssueTool {
     async fn execute(&self, _context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
         let number = parse_issue_number_input(&input).map_err(anyhow::Error::msg)?;
         let (issue, source) = self.cached_or_fetch(number).await?;
-        Ok(ToolResult::Json {
-            value: json!({
-                "source": source,
-                "issue": issue,
-            }),
-        })
+        Ok(ToolResult::json(json!({
+            "source": source,
+            "issue": issue,
+        })))
     }
 }
 
@@ -1358,6 +1358,7 @@ impl Tool for RankResponsesTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: false,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -1381,12 +1382,10 @@ impl Tool for RankResponsesTool {
             count = rankings.len(),
             "recorded panel response ranking"
         );
-        Ok(ToolResult::Json {
-            value: json!({
-                "recorded": true,
-                "ranked_panel_responses": rankings.len(),
-            }),
-        })
+        Ok(ToolResult::json(json!({
+            "recorded": true,
+            "ranked_panel_responses": rankings.len(),
+        })))
     }
 }
 
@@ -1813,18 +1812,18 @@ fn single_line_preview(text: &str, max_chars: usize) -> String {
 }
 
 fn tool_result_kind(result: &ToolResult) -> &'static str {
-    match result {
-        ToolResult::Empty => "empty",
-        ToolResult::Text { .. } => "text",
-        ToolResult::Json { .. } => "json",
+    match result.kind {
+        ToolResultKind::Empty => "empty",
+        ToolResultKind::Text { .. } => "text",
+        ToolResultKind::Json { .. } => "json",
     }
 }
 
 fn tool_result_size(result: &ToolResult) -> usize {
-    match result {
-        ToolResult::Empty => 0,
-        ToolResult::Text { text } => text.len(),
-        ToolResult::Json { value } => value.to_string().len(),
+    match &result.kind {
+        ToolResultKind::Empty => 0,
+        ToolResultKind::Text { text } => text.len(),
+        ToolResultKind::Json { value } => value.to_string().len(),
     }
 }
 
@@ -4298,18 +4297,10 @@ mod tests {
     fn tool_result_logging_helpers_cover_each_result_kind() {
         let json_value = json!({"a": 1});
         let cases = [
-            (ToolResult::Empty, "empty", 0),
+            (ToolResult::empty(), "empty", 0),
+            (ToolResult::text("hello"), "text", 5),
             (
-                ToolResult::Text {
-                    text: "hello".to_owned(),
-                },
-                "text",
-                5,
-            ),
-            (
-                ToolResult::Json {
-                    value: json_value.clone(),
-                },
+                ToolResult::json(json_value.clone()),
                 "json",
                 json_value.to_string().len(),
             ),

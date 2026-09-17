@@ -177,10 +177,10 @@ impl Tool for SpawnAgentTool {
         let request = self.normalize_request(request)?;
         let status = self.control.spawn(parent, request).await?;
         emit_completed(&context, "spawn_agent");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(status)
+        Ok(ToolResult::json(
+            serde_json::to_value(status)
                 .context("failed to execute spawn_agent tool: invalid status payload")?,
-        })
+        ))
     }
 }
 
@@ -238,10 +238,10 @@ impl Tool for SendInputTool {
             .context("failed to execute send_input tool: invalid input")?;
         let status = self.control.send_input(request).await?;
         emit_completed(&context, "send_input");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(status)
+        Ok(ToolResult::json(
+            serde_json::to_value(status)
                 .context("failed to execute send_input tool: invalid status payload")?,
-        })
+        ))
     }
 }
 
@@ -284,10 +284,10 @@ impl Tool for WaitAgentTool {
             .context("failed to execute wait_agent tool: invalid input")?;
         let response = self.control.wait(request).await?;
         emit_completed(&context, "wait_agent");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(response)
+        Ok(ToolResult::json(
+            serde_json::to_value(response)
                 .context("failed to execute wait_agent tool: invalid response payload")?,
-        })
+        ))
     }
 }
 
@@ -326,10 +326,10 @@ impl Tool for CloseAgentTool {
             .context("failed to execute close_agent tool: invalid input")?;
         let response = self.control.close(request).await?;
         emit_completed(&context, "close_agent");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(response)
+        Ok(ToolResult::json(
+            serde_json::to_value(response)
                 .context("failed to execute close_agent tool: invalid response payload")?,
-        })
+        ))
     }
 }
 
@@ -361,6 +361,7 @@ fn subagent_capabilities(long_running: bool) -> ToolCapabilities {
         requires_approval: false,
         cancellable: false,
         long_running,
+        ..Default::default()
     }
 }
 
@@ -384,7 +385,7 @@ mod tests {
     use halter_protocol::{
         AgentId, AgentName, CloseSubagentResponse, ModelId, ResourceSnapshot, SessionBlueprint,
         SessionId, SessionState, SpawnSubagentRequest, SubagentEventForwarding, SubagentState,
-        SubagentStatus, WaitSubagentRequest, WaitSubagentResponse,
+        SubagentStatus, ToolResultKind, WaitSubagentRequest, WaitSubagentResponse,
     };
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
@@ -500,7 +501,7 @@ mod tests {
             .await
             .expect("spawn succeeds");
 
-        let ToolResult::Json { value } = result else {
+        let ToolResultKind::Json { value } = result.kind else {
             panic!("expected json result");
         };
         assert_eq!(value["agent_id"], "agent-1");

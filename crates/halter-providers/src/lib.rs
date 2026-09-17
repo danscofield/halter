@@ -22,6 +22,7 @@ mod http_client;
 mod model_judge;
 mod openai;
 mod openai_codec;
+mod openai_embeddings;
 mod openai_error;
 mod openai_rate_limit;
 mod openai_rate_limit_policy;
@@ -53,6 +54,10 @@ pub use model_judge::{
     synthesis_guidance_message,
 };
 pub use openai::{OpenAiOAuthCredentials, OpenAiProvider};
+pub use openai_embeddings::{
+    EmbeddingClient, EmbeddingClientError, EmbeddingRequest, EmbeddingResponse,
+    OpenAiEmbeddingClient,
+};
 pub use openrouter::OpenRouterProvider;
 pub use registry::ModelRegistry;
 pub use resilience::{

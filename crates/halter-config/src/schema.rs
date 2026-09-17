@@ -35,6 +35,27 @@ pub const DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS: u64 = 30;
 /// Default provider retry jitter percentage.
 pub const DEFAULT_PROVIDER_RETRY_JITTER_PCT: u32 = 25;
 
+/// Default OpenAI embeddings model when none is configured.
+pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+/// Default per-request embedding timeout, in seconds.
+pub const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 30;
+/// Default total embedding request attempts, including the initial call.
+pub const DEFAULT_EMBEDDING_MAX_ATTEMPTS: u32 = 3;
+/// Default maximum embedding cache entry count.
+pub const DEFAULT_EMBEDDING_CACHE_MAX_ENTRIES: usize = 1024;
+
+/// Default Tool_Result_Cache entry TTL, in seconds, applied when
+/// `[tools].tool_cache_ttl_secs` is unset.
+pub const DEFAULT_TOOL_CACHE_TTL_SECS: u64 = 60;
+
+fn default_embedding_model() -> String {
+    DEFAULT_EMBEDDING_MODEL.to_owned()
+}
+
+const fn default_embedding_enabled() -> bool {
+    true
+}
+
 const fn default_provider_connect_timeout_secs() -> u64 {
     DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS
 }
@@ -92,6 +113,8 @@ pub struct HarnessConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub resilience: ResilienceConfig,
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 }
 
 impl Default for HarnessConfig {
@@ -108,6 +131,7 @@ impl Default for HarnessConfig {
             sessions: SessionsConfig::default(),
             runtime: RuntimeConfig::default(),
             resilience: ResilienceConfig::default(),
+            embedding: EmbeddingConfig::default(),
         }
     }
 }
@@ -140,6 +164,8 @@ impl HarnessConfig {
         }
         self.runtime.validate()?;
         self.resilience.validate("resilience")?;
+        self.embedding.validate("embedding")?;
+        self.tools.validate("tools")?;
         // Provider overrides are partial, so cross-field constraints can only
         // be checked on the effective (merged) config each provider will use.
         for provider in [
@@ -652,6 +678,69 @@ impl RequestRetryConfig {
                 self.base_backoff_ms
             );
         }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+/// Configuration for the OpenAI embedding source used by Tier 2 tail recall.
+///
+/// Credentials are resolved through `[providers.openai]`; this block only adds
+/// embedding-specific knobs (model, dimension, endpoint, timeout, retries, and
+/// cache bounds).
+pub struct EmbeddingConfig {
+    /// Enable flag; defaults to enabled.
+    #[serde(default = "default_embedding_enabled")]
+    pub enabled: bool,
+    /// Embeddings model id; defaults to `text-embedding-3-small`.
+    #[serde(default = "default_embedding_model")]
+    pub model: String,
+    /// Optional dimension override; when set, must be >= 1.
+    #[serde(default)]
+    pub dimension: Option<u32>,
+    /// Optional base URL override; defaults to the openai provider base URL
+    /// (`https://api.openai.com`) when unset.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Per-request timeout in seconds; defaults to 30 when unset, must be >= 1.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Maximum total attempts; defaults to 3 when unset, clamped to `1..=10`.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// Maximum embedding cache entry count; defaults to 1024 when unset,
+    /// must be >= 1.
+    #[serde(default)]
+    pub cache_max_entries: Option<u64>,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_embedding_enabled(),
+            model: default_embedding_model(),
+            dimension: None,
+            base_url: None,
+            timeout_secs: None,
+            max_attempts: None,
+            cache_max_entries: None,
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    /// Validate the embedding config's optional numeric bounds. Any of
+    /// `dimension`, `timeout_secs`, `max_attempts`, or `cache_max_entries`,
+    /// when set, must be an integer of 1 or greater.
+    fn validate(&self, path: &str) -> anyhow::Result<()> {
+        validate_optional_positive_u32(&format!("{path}.dimension"), self.dimension)?;
+        validate_optional_positive_u64(&format!("{path}.timeout_secs"), self.timeout_secs)?;
+        validate_optional_positive_u32(&format!("{path}.max_attempts"), self.max_attempts)?;
+        validate_optional_positive_u64(
+            &format!("{path}.cache_max_entries"),
+            self.cache_max_entries,
+        )?;
         Ok(())
     }
 }
@@ -1348,12 +1437,48 @@ const fn default_tokens_per_minute() -> Option<u64> {
     Some(500_000)
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// Backend that stores Tool_Result_Cache entries.
+pub enum ToolCacheBackend {
+    /// In-process memory cache scoped to the running harness. The default.
+    #[default]
+    Memory,
+    /// Shared Redis-backed cache.
+    Redis,
+    /// Persistent SQLite-backed cache.
+    Sqlite,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-/// Built-in tool selection.
+/// Built-in tool selection and Tool_Result_Cache settings.
 pub struct ToolsConfig {
     #[serde(default)]
     pub enabled: Vec<String>,
+    /// Enable the Tool_Result_Cache; defaults to disabled so existing
+    /// configurations retain today's behavior.
+    #[serde(default)]
+    pub cache_enabled: bool,
+    /// Single global default TTL applied to every Cacheable_Tool, in seconds.
+    /// Defaults to [`DEFAULT_TOOL_CACHE_TTL_SECS`] when unset; must be >= 1.
+    #[serde(default)]
+    pub tool_cache_ttl_secs: Option<u64>,
+    /// Backend that stores Tool_Result_Cache entries. Defaults to `memory`.
+    #[serde(default)]
+    pub tool_cache_backend: ToolCacheBackend,
+}
+
+impl ToolsConfig {
+    /// Validate the tool cache's optional numeric bounds. `tool_cache_ttl_secs`,
+    /// when set, must be an integer of 1 or greater.
+    fn validate(&self, path: &str) -> anyhow::Result<()> {
+        validate_optional_positive_u64(
+            &format!("{path}.tool_cache_ttl_secs"),
+            self.tool_cache_ttl_secs,
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

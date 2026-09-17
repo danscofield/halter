@@ -52,6 +52,7 @@ impl Tool for ImageTool {
                 requires_approval: false,
                 cancellable: false,
                 long_running: true,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -160,7 +161,7 @@ impl Tool for ImageTool {
         })
         .await??;
 
-        Ok(ToolResult::Json { value: result })
+        Ok(ToolResult::json(result))
     }
 }
 

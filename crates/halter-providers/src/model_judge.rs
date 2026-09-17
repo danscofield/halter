@@ -374,9 +374,7 @@ pub async fn run_panel_synthesis(
         messages.push(Message::Tool(ToolResultMessage {
             id: MessageId::new(),
             call_id: call.id.clone(),
-            content: ToolResult::Json {
-                value: json!({ "status": "recorded" }),
-            },
+            content: ToolResult::json(json!({ "status": "recorded" })),
             error: None,
             created_at: Utc::now(),
         }));

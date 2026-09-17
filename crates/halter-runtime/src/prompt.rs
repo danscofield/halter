@@ -261,10 +261,10 @@ fn render_message(message: &Message) -> String {
         }
         Message::Tool(message) => (
             "tool",
-            match &message.content {
-                halter_protocol::ToolResult::Empty => "<empty>".to_owned(),
-                halter_protocol::ToolResult::Text { text } => text.clone(),
-                halter_protocol::ToolResult::Json { value } => value.to_string(),
+            match &message.content.kind {
+                halter_protocol::ToolResultKind::Empty => "<empty>".to_owned(),
+                halter_protocol::ToolResultKind::Text { text } => text.clone(),
+                halter_protocol::ToolResultKind::Json { value } => value.to_string(),
             },
         ),
     };

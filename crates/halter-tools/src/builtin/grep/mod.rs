@@ -64,6 +64,7 @@ impl Tool for GrepTool {
                 requires_approval: false,
                 cancellable: true,
                 long_running: true,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -110,7 +111,7 @@ impl Tool for GrepTool {
         })
         .await??;
 
-        Ok(ToolResult::Json { value: response })
+        Ok(ToolResult::json(response))
     }
 }
 

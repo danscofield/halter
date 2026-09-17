@@ -12,15 +12,19 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+halter-config = { path = "../halter-config", version = "0.5.0" }
 halter-hooks = { path = "../halter-hooks", version = "0.5.0" }
 halter-protocol = { path = "../halter-protocol", version = "0.5.0" }
+halter-providers = { path = "../halter-providers", version = "0.5.0" }
 halter-session = { path = "../halter-session", version = "0.5.0" }
+lru.workspace = true
 rusqlite = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

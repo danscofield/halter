@@ -15,31 +15,26 @@
 //!   don't await.
 //!
 //! - **Retrieval + replay -> Tier 1, on the hot path** (task 16.2, Requirements
-//!   13.2, 19.1, 20.1, 23.1). [`Tier1EvidenceValidator`] is the concrete
-//!   [`EvidenceValidator`](crate::tier2::EvidenceValidator) deferred from task
-//!   14.x: it drives [`Tier1Cache::revalidate`](crate::tier1::Tier1Cache::revalidate)
-//!   for evidence items and [`tokens::holds`](crate::tier1::tokens::holds) for
-//!   answer tokens, resolving each item/token back to its
-//!   [`SourceDescriptor`](crate::types::SourceDescriptor) through a
-//!   [`SourceResolver`]. [`start_goal`] ties
+//!   13.2, 19.1, 20.1, 23.1). [`start_goal`] ties
 //!   [`Retrieval::retrieve_memories`](crate::tier2::Retrieval::retrieve_memories)
-//!   into [`decide_replay`](crate::tier2::decide_replay), mirroring the design's
-//!   `start_goal`.
+//!   into [`decide_replay`](crate::tier2::decide_replay), re-validating evidence
+//!   and answer tokens through a caller-supplied
+//!   [`EvidenceValidator`](crate::tier2::EvidenceValidator), mirroring the
+//!   design's `start_goal`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use halter_providers::EmbeddingClient;
+
 use crate::goal_model::{ClosureSignal, GoalStore, InductionQueue};
-use crate::tier1::cache::{Freshness, Tier1Cache};
-use crate::tier1::tokens::{self, SourceProvider};
-use crate::tier2::memory::EvidenceContractItem;
 use crate::tier2::store::MemoryStore;
 use crate::tier2::{
     decide_replay, EvidenceValidator, GoalSummary, InductionEngine, InductionOutcome, ModeBPolicy,
-    ReplayDecision, Retrieval, SummaryProvider, TokensHold,
+    ReplayDecision, Retrieval, ScoredMemory, SummaryProvider,
 };
-use crate::types::{IntentSignature, SourceDescriptor, Timestamp, ValidityToken};
+use crate::types::{IntentSignature, Timestamp};
 
 // ===========================================================================
 // Task 16.1 — closure -> induction, async, off the hot path
@@ -67,18 +62,20 @@ use crate::types::{IntentSignature, SourceDescriptor, Timestamp, ValidityToken};
 ///
 /// - `G` — the [`GoalStore`] the node is resolved from.
 /// - `M` — the [`MemoryStore`] the [`InductionEngine`] writes to.
+/// - `C` — the [`EmbeddingClient`] the [`InductionEngine`]'s write-path writer
+///   uses (see [`InductionEngine::with_writer`]).
 ///
 /// Both the store and the engine are shared (`Arc`) so the spawned task can own
 /// clones that outlive the `enqueue` call.
-pub struct EngineInductionQueue<G: GoalStore, M: MemoryStore> {
+pub struct EngineInductionQueue<G: GoalStore, M: MemoryStore, C: EmbeddingClient> {
     store: Arc<G>,
-    engine: Arc<InductionEngine<M>>,
+    engine: Arc<InductionEngine<M, C>>,
 }
 
-impl<G: GoalStore, M: MemoryStore> EngineInductionQueue<G, M> {
+impl<G: GoalStore, M: MemoryStore, C: EmbeddingClient> EngineInductionQueue<G, M, C> {
     /// Wire a goal `store` (to resolve closed nodes) to an induction `engine`.
     #[must_use]
-    pub fn new(store: Arc<G>, engine: Arc<InductionEngine<M>>) -> Self {
+    pub fn new(store: Arc<G>, engine: Arc<InductionEngine<M, C>>) -> Self {
         Self { store, engine }
     }
 
@@ -104,10 +101,11 @@ impl<G: GoalStore, M: MemoryStore> EngineInductionQueue<G, M> {
 }
 
 #[async_trait]
-impl<G, M> InductionQueue for EngineInductionQueue<G, M>
+impl<G, M, C> InductionQueue for EngineInductionQueue<G, M, C>
 where
     G: GoalStore + 'static,
     M: MemoryStore + Send + Sync + 'static,
+    C: EmbeddingClient + 'static,
 {
     async fn enqueue(&self, signal: ClosureSignal) {
         // Hand the job to a spawned task and return: induction runs off the hot
@@ -127,137 +125,6 @@ where
 // ===========================================================================
 // Task 16.2 — retrieval + replay -> Tier 1, on the hot path
 // ===========================================================================
-
-/// Resolves an evidence item or answer token back to the
-/// [`SourceDescriptor`](crate::types::SourceDescriptor) it was issued against,
-/// plus a distinguished "backend unavailable" signal.
-///
-/// A [`ValidityToken`] and an [`EvidenceContractItem`] deliberately do **not**
-/// carry a `SourceDescriptor` (Tier 2 stores contracts, not sources — see the
-/// replay module docs). To re-validate through Tier 1, the concrete validator
-/// must map each token/item back to its source. That mapping is this trait's
-/// job, kept behind a seam so the validator does not hard-code any particular
-/// resolution strategy (a session-scoped map, a tool registry, etc.).
-///
-/// [`resolve`](Self::resolve) returns:
-///
-/// - [`SourceResolution::Resolved`] with the descriptor to re-observe;
-/// - [`SourceResolution::Unresolvable`] when the token cannot be mapped to a
-///   source but Tier 1 itself is reachable (treated fail-safe as *stale*); or
-/// - [`SourceResolution::Unavailable`] when the Tier 1 backend cannot be reached
-///   at all (drives Requirement 23.4 / the [`TokensHold::Unavailable`] path).
-pub trait SourceResolver {
-    /// Resolve `token` to its source (or report it unresolvable / the backend
-    /// unavailable).
-    fn resolve(&self, token: &ValidityToken) -> SourceResolution;
-}
-
-/// The result of resolving a token/item to its source (see [`SourceResolver`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SourceResolution {
-    /// The token maps to this source; re-validate against it.
-    Resolved(SourceDescriptor),
-    /// The token could not be mapped to a source, though Tier 1 is reachable.
-    /// Treated fail-safe as stale (no verified serve).
-    Unresolvable,
-    /// The Tier 1 backend is unavailable; no token can be confirmed
-    /// (Requirement 23.4).
-    Unavailable,
-}
-
-/// The concrete, Tier 1-backed [`EvidenceValidator`] (task 16.2).
-///
-/// Bridges [`decide_replay`](crate::tier2::decide_replay) to real Tier 1
-/// re-validation without leaking Tier 1's generics into the engine:
-///
-/// - [`revalidate_item`](EvidenceValidator::revalidate_item) resolves the item's
-///   token to its source and calls
-///   [`Tier1Cache::revalidate`](crate::tier1::Tier1Cache::revalidate); an
-///   unresolvable source or an unreachable backend is reported
-///   [`Freshness::Stale`] (fail-safe, Requirements 23.1, 23.3, 23.4).
-/// - [`tokens_hold`](EvidenceValidator::tokens_hold) resolves every answer token
-///   to its source and calls [`tokens::holds`](crate::tier1::tokens::holds): if
-///   all hold it reports [`TokensHold::AllHold`]; if the resolver reports the
-///   backend [`SourceResolution::Unavailable`] it reports
-///   [`TokensHold::Unavailable`] (Requirement 23.4); otherwise
-///   [`TokensHold::SomeStale`] (Requirements 20.1–20.4).
-///
-/// # Generic parameters
-///
-/// - `C` — the [`Tier1Cache`] used for evidence-item re-validation.
-/// - `P` — the [`SourceProvider`] that observes current source state.
-/// - `R` — the [`SourceResolver`] mapping tokens/items to sources.
-pub struct Tier1EvidenceValidator<'a, C: Tier1Cache, P: SourceProvider, R: SourceResolver> {
-    cache: &'a C,
-    provider: &'a P,
-    resolver: &'a R,
-}
-
-impl<'a, C: Tier1Cache, P: SourceProvider, R: SourceResolver>
-    Tier1EvidenceValidator<'a, C, P, R>
-{
-    /// Build the validator over a Tier 1 `cache`, a source `provider`, and a
-    /// `resolver` that maps tokens/items back to their sources.
-    #[must_use]
-    pub fn new(cache: &'a C, provider: &'a P, resolver: &'a R) -> Self {
-        Self {
-            cache,
-            provider,
-            resolver,
-        }
-    }
-}
-
-impl<C: Tier1Cache, P: SourceProvider, R: SourceResolver> EvidenceValidator
-    for Tier1EvidenceValidator<'_, C, P, R>
-{
-    fn revalidate_item(&self, item: &EvidenceContractItem) -> Freshness {
-        // Resolve the item's token to its source. An unresolvable source or an
-        // unavailable backend is fail-safe stale (Requirements 23.3, 23.4) —
-        // procedure replay treats it as not-fresh and serves no verified answer.
-        match self.resolver.resolve(&item.validity_token) {
-            SourceResolution::Resolved(source) => self.cache.revalidate(
-                &item.tool,
-                &item.normalized_args,
-                &source,
-                &item.validity_token,
-                self.provider,
-            ),
-            SourceResolution::Unresolvable | SourceResolution::Unavailable => Freshness::Stale,
-        }
-    }
-
-    fn tokens_hold(&self, tokens: &[ValidityToken]) -> TokensHold {
-        // Empty token sets cannot be confirmed to hold; treat as stale so a
-        // Mode A answer with no tokens is never served verified (the store
-        // already rejects such answers at write time; this is defense in depth).
-        if tokens.is_empty() {
-            return TokensHold::SomeStale;
-        }
-
-        let mut all_hold = true;
-        for token in tokens {
-            match self.resolver.resolve(token) {
-                SourceResolution::Resolved(source) => {
-                    if !tokens::holds(token, &source, self.provider) {
-                        all_hold = false;
-                    }
-                }
-                // Backend unavailable dominates: no token can be confirmed, so
-                // report Unavailable immediately (Requirement 23.4).
-                SourceResolution::Unavailable => return TokensHold::Unavailable,
-                // Unresolvable but backend up: that token is stale.
-                SourceResolution::Unresolvable => all_hold = false,
-            }
-        }
-
-        if all_hold {
-            TokensHold::AllHold
-        } else {
-            TokensHold::SomeStale
-        }
-    }
-}
 
 /// The hot-path outcome of starting a goal: either a memory-driven replay
 /// decision, or a signal that there was no applicable memory (do real work).
@@ -288,18 +155,21 @@ pub enum GoalStart {
 ///
 /// - `sig` — the new goal's intent signature (drives retrieval and Mode B opt-in).
 /// - `retrieval` — the structured-first retrieval engine.
-/// - `validator` — the Tier 1-backed evidence validator (see
-///   [`Tier1EvidenceValidator`]).
+/// - `validator` — the caller-supplied evidence validator.
 /// - `mode_b_policy` — the Mode B opt-in policy.
 /// - `now` — the serve-time instant (used for Mode B age).
-pub fn start_goal(
+///
+/// This function is `async` because [`Retrieval::retrieve_memories`] now awaits
+/// the embedding backend when the structured head is thin (Requirements 1.4,
+/// 6.3). The replay decision itself is unchanged.
+pub async fn start_goal(
     sig: &IntentSignature,
     retrieval: &impl Retrieval,
     validator: &impl EvidenceValidator,
     mode_b_policy: &impl ModeBPolicy,
     now: Timestamp,
 ) -> GoalStart {
-    let candidates = retrieval.retrieve_memories(sig);
+    let candidates = retrieval.retrieve_memories(sig).await;
     let Some(top) = candidates.first() else {
         // Cold: no memory, do real work (design `GoalPlan::from_scratch`).
         return GoalStart::FromScratch;
@@ -340,12 +210,15 @@ pub struct GoalStartWithSummaries {
 ///
 /// - `sig` — the new goal's intent signature (drives retrieval and Mode B opt-in).
 /// - `retrieval` — the structured-first retrieval engine.
-/// - `validator` — the Tier 1-backed evidence validator (see
-///   [`Tier1EvidenceValidator`]).
+/// - `validator` — the caller-supplied evidence validator.
 /// - `mode_b_policy` — the Mode B opt-in policy.
 /// - `now` — the serve-time instant (used for Mode B age).
 /// - `summary_provider` — the opt-in similar-goal summary provider.
-pub fn start_goal_with_summaries(
+///
+/// This function is `async` because both [`start_goal`] and
+/// [`SummaryProvider::summaries_for`] now await the embedding backend through
+/// retrieval (Requirements 1.4, 6.3).
+pub async fn start_goal_with_summaries(
     sig: &IntentSignature,
     retrieval: &impl Retrieval,
     validator: &impl EvidenceValidator,
@@ -356,41 +229,94 @@ pub fn start_goal_with_summaries(
     // Compute the replay decision via the UNTOUCHED start_goal first, so the
     // decision is identical whether or not summaries are enabled (Requirements
     // 13.3, 14.1, 14.2, 15.1).
-    let start = start_goal(sig, retrieval, validator, mode_b_policy, now);
+    let start = start_goal(sig, retrieval, validator, mode_b_policy, now).await;
     // Attach summaries best-effort; summaries_for reads through the same
     // structured-first retrieval and honors the opt-in config (Requirements
     // 15.1, 15.2).
-    let summaries = summary_provider.summaries_for(sig, retrieval);
+    let summaries = summary_provider.summaries_for(sig, retrieval).await;
     GoalStartWithSummaries { start, summaries }
+}
+
+// ===========================================================================
+// Advisory entry point — the verification bypass (Req 5)
+// ===========================================================================
+
+/// The advisory payload for a newly-opened goal (Req 5.3). It carries ONLY the
+/// applicable memories and their summaries — no replay decision, no validation
+/// result, no served answer (Req 5.4). Empty when retrieval finds nothing
+/// (Req 5.5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdvisorySummary {
+    /// Applicable memories in retrieval order (score-descending, structured-head
+    /// first). Compact `Memory` values, never raw transcripts.
+    pub memories: Vec<ScoredMemory>,
+    /// Similar-goal summaries (empty when the provider is disabled / no
+    /// candidates / on failure). Additive over `memories`.
+    pub summaries: Vec<GoalSummary>,
+}
+
+impl AdvisorySummary {
+    /// The empty advisory (no applicable memory). `goal` proceeds as if no
+    /// memory existed (Req 5.5).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            memories: Vec::new(),
+            summaries: Vec::new(),
+        }
+    }
+
+    /// True when there is nothing to inject.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.memories.is_empty() && self.summaries.is_empty()
+    }
+}
+
+/// Run advisory retrieval for a newly-opened goal.
+///
+/// Runs the UNCHANGED structured-first [`Retrieval::retrieve_memories`]
+/// (structured filter first; embed only when the head is thin — Req 5.2, 5.6)
+/// and the opt-in [`SummaryProvider::summaries_for`], and returns the applicable
+/// memories + summaries ONLY. It calls neither
+/// [`decide_replay`](crate::tier2::decide_replay) nor any
+/// [`EvidenceValidator`](crate::tier2::EvidenceValidator) and constructs no
+/// [`ReplayDecision`](crate::tier2::ReplayDecision) (Req 5.3, 5.4). Never errors:
+/// a degraded embedding backend yields a structured-head-only advisory
+/// (Req 10.3).
+pub async fn retrieve_advisory(
+    sig: &IntentSignature,
+    retrieval: &impl Retrieval,
+    summary_provider: &SummaryProvider,
+) -> AdvisorySummary {
+    let memories = retrieval.retrieve_memories(sig).await;
+    let summaries = summary_provider.summaries_for(sig, retrieval).await;
+    AdvisorySummary { memories, summaries }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::cell::Cell;
-    use std::collections::HashMap;
-
     use crate::goal_model::{
         EventLogGoalStore, InMemoryGoalEventLog, Resolution, SharedInductionQueue,
     };
-    use crate::tier1::cache::InMemoryTier1Cache;
-    use crate::tier1::tokens::SourceUnreachable;
+    use crate::tier1::cache::Freshness;
     use crate::tier2::memory::{
-        AnswerMode, Applicability, CachedOutcome, EvidenceContract, Memory, MemoryKind,
-        MemoryVersion, OutcomeShape, OutcomeValue, ParameterSchema, Plan, PlanStep, Provenance,
-        Reinforcement,
+        AnswerMode, Applicability, CachedOutcome, EvidenceContract, EvidenceContractItem, Memory,
+        MemoryKind, MemoryVersion, OutcomeShape, OutcomeValue, ParameterSchema, Plan, PlanStep,
+        Provenance, Reinforcement,
     };
     use crate::tier2::retrieval::{EmbeddingSource, MemoryRetrieval};
     use crate::tier2::store::InMemoryMemoryStore;
     use crate::tier2::{
         AllowListModeB, Author, AuthorError, CleanContext, DenyAllModeB, Embedding, Granularity,
-        InMemoryRecurrenceTracker, InductionEngine, Judge, JudgeVerdict, SummaryConfig,
+        InMemoryRecurrenceTracker, InductionEngine, Judge, JudgeVerdict, NoEmbeddingClient,
+        SummaryConfig, TokensHold,
     };
     use crate::types::{
-        CanonicalJson, ContentRef, Duration, EventKey, EventSeq, GoalNodeId, IntentSignature,
-        IntentType, MemoryId, OutcomeRef, Scope, Sha256, SubtreeHash, TargetRef, TargetType,
-        Timestamp, ToolName,
+        CanonicalJson, Duration, GoalNodeId, IntentSignature, IntentType, MemoryId, OutcomeRef,
+        Scope, Sha256, SubtreeHash, TargetRef, TargetType, Timestamp, ToolName, ValidityToken,
     };
 
     use async_trait::async_trait;
@@ -411,12 +337,6 @@ mod tests {
         ValidityToken::ContentHash(Sha256::from(h))
     }
 
-    fn pinnable(reference: &str) -> SourceDescriptor {
-        SourceDescriptor::Pinnable {
-            content: ContentRef::from(reference),
-        }
-    }
-
     fn contract_item(tool: &str, args: &str, token: ValidityToken) -> EvidenceContractItem {
         EvidenceContractItem {
             tool: ToolName::from(tool),
@@ -425,98 +345,31 @@ mod tests {
         }
     }
 
-    /// A deterministic in-memory provider: content by `ContentRef`, a settable
-    /// clock, and event sequences by `EventKey`. A missing key models an
-    /// unreachable source.
-    struct FakeProvider {
-        content: HashMap<String, Vec<u8>>,
-        now: Cell<u64>,
-    }
+    /// A tiny test-only [`EvidenceValidator`] that never confirms freshness.
+    ///
+    /// The concrete Tier-1-backed validator was removed with the verification
+    /// tier; the kept [`start_goal`] / [`start_goal_with_summaries`] tests only
+    /// need *some* validator to drive [`decide_replay`], so this fixture reports
+    /// every item [`Freshness::Stale`] and every token set
+    /// [`TokensHold::SomeStale`]. That is enough to exercise the kept public
+    /// functions end to end (replay itself is covered by `replay.rs`).
+    struct StaleValidator;
 
-    impl FakeProvider {
-        fn new() -> Self {
-            Self {
-                content: HashMap::new(),
-                now: Cell::new(0),
-            }
+    impl EvidenceValidator for StaleValidator {
+        fn revalidate_item(&self, _item: &EvidenceContractItem) -> Freshness {
+            Freshness::Stale
         }
 
-        fn with_content(mut self, reference: &str, bytes: &[u8]) -> Self {
-            self.content.insert(reference.to_owned(), bytes.to_vec());
-            self
-        }
-
-        fn set_content(&mut self, reference: &str, bytes: &[u8]) {
-            self.content.insert(reference.to_owned(), bytes.to_vec());
-        }
-    }
-
-    impl SourceProvider for FakeProvider {
-        fn read_content(&self, content: &ContentRef) -> Result<Vec<u8>, SourceUnreachable> {
-            self.content
-                .get(&content.0)
-                .cloned()
-                .ok_or_else(|| SourceUnreachable::new(format!("no content at `{content}`")))
-        }
-
-        fn now(&self) -> Timestamp {
-            Timestamp(self.now.get())
-        }
-
-        fn latest_event_seq(
-            &self,
-            subscription: &EventKey,
-        ) -> Result<EventSeq, SourceUnreachable> {
-            Err(SourceUnreachable::new(format!(
-                "cannot observe `{subscription}`"
-            )))
-        }
-    }
-
-    /// A resolver backed by an explicit token -> source map, with an
-    /// "unavailable" switch modelling Tier 1 being down.
-    struct MapResolver {
-        map: HashMap<String, SourceDescriptor>,
-        unavailable: bool,
-    }
-
-    impl MapResolver {
-        fn new() -> Self {
-            Self {
-                map: HashMap::new(),
-                unavailable: false,
-            }
-        }
-
-        fn with(mut self, token: &ValidityToken, source: SourceDescriptor) -> Self {
-            self.map.insert(format!("{token:?}"), source);
-            self
-        }
-
-        fn unavailable() -> Self {
-            Self {
-                map: HashMap::new(),
-                unavailable: true,
-            }
-        }
-    }
-
-    impl SourceResolver for MapResolver {
-        fn resolve(&self, token: &ValidityToken) -> SourceResolution {
-            if self.unavailable {
-                return SourceResolution::Unavailable;
-            }
-            match self.map.get(&format!("{token:?}")) {
-                Some(source) => SourceResolution::Resolved(source.clone()),
-                None => SourceResolution::Unresolvable,
-            }
+        fn tokens_hold(&self, _tokens: &[ValidityToken]) -> TokensHold {
+            TokensHold::SomeStale
         }
     }
 
     /// An always-available embedder for retrieval.
     struct FixedEmbedder;
+    #[async_trait]
     impl EmbeddingSource for FixedEmbedder {
-        fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
+        async fn embed(&self, _sig: &IntentSignature) -> Option<Embedding> {
             Some(Embedding(vec![0.1, 0.2, 0.3]))
         }
     }
@@ -566,135 +419,61 @@ mod tests {
         (GoalNodeId::from(id), SubtreeHash(Sha256::from("h")))
     }
 
-    // --- Tier1EvidenceValidator: revalidate_item (13.2, 23.1) -------------
+    // --- start_goal: retrieval hit / miss ---------------------------------
 
-    #[test]
-    fn validator_reports_fresh_when_item_token_holds() {
-        // Requirements 13.2, 23.1: a holding ContentHash token => Fresh.
-        let provider = FakeProvider::new().with_content("file://a", b"v1");
-        let cache = InMemoryTier1Cache::new();
-        let source = pinnable("file://a");
-        let token = cache.issue_token(&source, &provider).expect("issue");
-        let resolver = MapResolver::new().with(&token, source.clone());
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
+    #[tokio::test]
+    async fn start_goal_retrieval_hit_invokes_decide_replay() {
+        // A retrieval hit (no cached_outcome) => decide_replay is invoked and
+        // returns a ReplayProcedure decision carrying the re-validated evidence.
+        let token = content_token("a");
+        let store = InMemoryMemoryStore::new();
+        store
+            .insert(
+                key("n"),
+                memory_with("m", None, vec![contract_item("read_file", "{}", token)]),
+            )
+            .expect("insert");
+        let embedder = FixedEmbedder;
+        let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let item = contract_item("read_file", "{}", token);
-        assert_eq!(validator.revalidate_item(&item), Freshness::Fresh);
+        let start = start_goal(&sig(), &retrieval, &StaleValidator, &DenyAllModeB, Timestamp(0))
+            .await;
+        match start {
+            GoalStart::Replay(ReplayDecision::ReplayProcedure {
+                evidence,
+                evidence_fully_fresh,
+                ..
+            }) => {
+                assert_eq!(evidence.len(), 1);
+                assert!(
+                    !evidence_fully_fresh,
+                    "the stale validator reports the single item's token as not holding"
+                );
+            }
+            other => panic!("expected ReplayProcedure, got {other:?}"),
+        }
     }
 
-    #[test]
-    fn validator_reports_stale_when_item_token_does_not_hold() {
-        // Requirement 23.1/23.3: mutated source => token stale => Stale.
-        let mut provider = FakeProvider::new().with_content("file://a", b"v1");
-        let cache = InMemoryTier1Cache::new();
-        let source = pinnable("file://a");
-        let token = cache.issue_token(&source, &provider).expect("issue");
-        let resolver = MapResolver::new().with(&token, source.clone());
+    #[tokio::test]
+    async fn start_goal_no_candidates_returns_from_scratch() {
+        // Empty store => no candidates => FromScratch (design GoalPlan::from_scratch).
+        let store = InMemoryMemoryStore::new();
+        let embedder = FixedEmbedder;
+        let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        provider.set_content("file://a", b"v2");
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-        let item = contract_item("read_file", "{}", token);
-        assert_eq!(validator.revalidate_item(&item), Freshness::Stale);
+        let start = start_goal(&sig(), &retrieval, &StaleValidator, &DenyAllModeB, Timestamp(0))
+            .await;
+        assert_eq!(start, GoalStart::FromScratch);
     }
 
-    #[test]
-    fn validator_reports_stale_when_source_unresolvable() {
-        // Fail-safe (23.3): a token the resolver cannot map => Stale.
-        let provider = FakeProvider::new();
-        let cache = InMemoryTier1Cache::new();
-        let resolver = MapResolver::new(); // maps nothing
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
+    // --- Mode A end to end through decide_replay --------------------------
 
-        let item = contract_item("read_file", "{}", content_token("unknown"));
-        assert_eq!(validator.revalidate_item(&item), Freshness::Stale);
-    }
-
-    #[test]
-    fn validator_reports_stale_when_backend_unavailable() {
-        // Requirement 23.4: Tier 1 down => every item stale.
-        let provider = FakeProvider::new();
-        let cache = InMemoryTier1Cache::new();
-        let resolver = MapResolver::unavailable();
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
-        let item = contract_item("read_file", "{}", content_token("x"));
-        assert_eq!(validator.revalidate_item(&item), Freshness::Stale);
-    }
-
-    // --- Tier1EvidenceValidator: tokens_hold (20.1, 23.4) -----------------
-
-    #[test]
-    fn validator_tokens_all_hold_when_all_fresh() {
-        // Requirement 20.1: every token holds => AllHold.
-        let provider = FakeProvider::new()
-            .with_content("file://a", b"v1")
-            .with_content("file://b", b"v2");
-        let cache = InMemoryTier1Cache::new();
-        let sa = pinnable("file://a");
-        let sb = pinnable("file://b");
-        let ta = cache.issue_token(&sa, &provider).expect("issue a");
-        let tb = cache.issue_token(&sb, &provider).expect("issue b");
-        let resolver = MapResolver::new()
-            .with(&ta, sa.clone())
-            .with(&tb, sb.clone());
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
-        assert_eq!(
-            validator.tokens_hold(&[ta, tb]),
-            TokensHold::AllHold
-        );
-    }
-
-    #[test]
-    fn validator_tokens_some_stale_when_one_fails() {
-        // Requirement 20.2: any stale token => SomeStale (never verified).
-        let mut provider = FakeProvider::new()
-            .with_content("file://a", b"v1")
-            .with_content("file://b", b"v2");
-        let cache = InMemoryTier1Cache::new();
-        let sa = pinnable("file://a");
-        let sb = pinnable("file://b");
-        let ta = cache.issue_token(&sa, &provider).expect("issue a");
-        let tb = cache.issue_token(&sb, &provider).expect("issue b");
-        let resolver = MapResolver::new()
-            .with(&ta, sa.clone())
-            .with(&tb, sb.clone());
-
-        provider.set_content("file://b", b"changed");
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-        assert_eq!(
-            validator.tokens_hold(&[ta, tb]),
-            TokensHold::SomeStale
-        );
-    }
-
-    #[test]
-    fn validator_tokens_unavailable_when_backend_down() {
-        // Requirement 23.4: backend down => Unavailable.
-        let provider = FakeProvider::new();
-        let cache = InMemoryTier1Cache::new();
-        let resolver = MapResolver::unavailable();
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
-        assert_eq!(
-            validator.tokens_hold(&[content_token("x")]),
-            TokensHold::Unavailable
-        );
-    }
-
-    // --- Mode A end to end through decide_replay (20.1) -------------------
-
-    #[test]
-    fn mode_a_answer_tokens_hold_serves_verified() {
-        // Requirement 20.1: a Mode A answer whose tokens hold in Tier 1 => the
-        // full retrieval->replay path serves verified.
-        let provider = FakeProvider::new().with_content("file://a", b"v1");
-        let cache = InMemoryTier1Cache::new();
-        let source = pinnable("file://a");
-        let token = cache.issue_token(&source, &provider).expect("issue");
-        let resolver = MapResolver::new().with(&token, source.clone());
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
+    #[tokio::test]
+    async fn mode_a_stale_tokens_fall_through_to_replay() {
+        // A Mode A answer whose tokens do NOT hold falls through to procedure
+        // replay: `decide_replay` never serves a Mode A answer believed-unverified,
+        // so the full retrieval->replay path yields ReplayProcedure.
+        let token = content_token("a");
         let store = InMemoryMemoryStore::new();
         store
             .insert(
@@ -705,70 +484,57 @@ mod tests {
         let embedder = FixedEmbedder;
         let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let start = start_goal(&sig(), &retrieval, &validator, &DenyAllModeB, Timestamp(0));
+        let start = start_goal(&sig(), &retrieval, &StaleValidator, &DenyAllModeB, Timestamp(0))
+            .await;
         match start {
-            GoalStart::Replay(ReplayDecision::ServeAnswer { verified, .. }) => {
-                assert!(verified, "Mode A answer with holding tokens serves verified");
-            }
-            other => panic!("expected verified ServeAnswer, got {other:?}"),
+            GoalStart::Replay(ReplayDecision::ReplayProcedure { .. }) => {}
+            other => panic!("expected ReplayProcedure fall-through, got {other:?}"),
         }
     }
 
-    // --- start_goal: retrieval hit / miss ---------------------------------
+    // --- retrieve_advisory: memories + summaries only, never replay -------
 
-    #[test]
-    fn start_goal_retrieval_hit_invokes_decide_replay() {
-        // A retrieval hit (no cached_outcome) => decide_replay is invoked and
-        // returns a ReplayProcedure decision.
-        let provider = FakeProvider::new().with_content("file://a", b"v1");
-        let cache = InMemoryTier1Cache::new();
-        let source = pinnable("file://a");
-        let token = cache.issue_token(&source, &provider).expect("issue");
-        let resolver = MapResolver::new().with(&token, source.clone());
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
+    #[tokio::test]
+    async fn retrieve_advisory_empty_store_is_empty() {
+        // An empty store yields no structured head and (with an available
+        // embedder) an empty ann_recall, so retrieval returns no candidates and
+        // the advisory is empty (Req 5.5) — equivalent to AdvisorySummary::empty.
+        let store = InMemoryMemoryStore::new();
+        let embedder = FixedEmbedder;
+        let retrieval = MemoryRetrieval::new(&store, &embedder);
+        let summary_provider = SummaryProvider::new(SummaryConfig {
+            enabled: true,
+            max_summaries: None,
+        });
 
+        let advisory = retrieve_advisory(&sig(), &retrieval, &summary_provider).await;
+
+        assert!(advisory.is_empty(), "empty store => empty advisory");
+        assert_eq!(advisory, AdvisorySummary::empty());
+    }
+
+    #[tokio::test]
+    async fn retrieve_advisory_returns_applicable_memories() {
+        // A store with one applicable memory => the advisory surfaces that
+        // memory (Req 5.1, 5.3). No replay/validation is involved — the function
+        // only runs retrieve_memories + summaries_for.
         let store = InMemoryMemoryStore::new();
         store
-            .insert(
-                key("n"),
-                memory_with(
-                    "m",
-                    None,
-                    vec![contract_item("read_file", "{}", token)],
-                ),
-            )
+            .insert(key("n"), memory_with("m", None, vec![]))
             .expect("insert");
         let embedder = FixedEmbedder;
         let retrieval = MemoryRetrieval::new(&store, &embedder);
+        let summary_provider = SummaryProvider::new(SummaryConfig::default());
 
-        let start = start_goal(&sig(), &retrieval, &validator, &DenyAllModeB, Timestamp(0));
-        match start {
-            GoalStart::Replay(ReplayDecision::ReplayProcedure {
-                evidence,
-                evidence_fully_fresh,
-                ..
-            }) => {
-                assert_eq!(evidence.len(), 1);
-                assert!(evidence_fully_fresh, "the single item's token holds");
-            }
-            other => panic!("expected ReplayProcedure, got {other:?}"),
-        }
-    }
+        let advisory = retrieve_advisory(&sig(), &retrieval, &summary_provider).await;
 
-    #[test]
-    fn start_goal_no_candidates_returns_from_scratch() {
-        // Empty store => no candidates => FromScratch (design GoalPlan::from_scratch).
-        let provider = FakeProvider::new();
-        let cache = InMemoryTier1Cache::new();
-        let resolver = MapResolver::new();
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
-        let store = InMemoryMemoryStore::new();
-        let embedder = FixedEmbedder;
-        let retrieval = MemoryRetrieval::new(&store, &embedder);
-
-        let start = start_goal(&sig(), &retrieval, &validator, &DenyAllModeB, Timestamp(0));
-        assert_eq!(start, GoalStart::FromScratch);
+        assert!(!advisory.is_empty(), "an applicable memory => non-empty advisory");
+        assert_eq!(advisory.memories.len(), 1, "the single applicable memory is surfaced");
+        assert_eq!(
+            advisory.memories[0].memory.id,
+            MemoryId::from("m"),
+            "the surfaced memory is the one inserted"
+        );
     }
 
     // --- Task 16.1: closure -> induction end to end -----------------------
@@ -825,7 +591,7 @@ mod tests {
     fn induction_engine(
         store: Arc<InMemoryMemoryStore>,
         threshold: u64,
-    ) -> InductionEngine<InMemoryMemoryStore> {
+    ) -> InductionEngine<InMemoryMemoryStore, NoEmbeddingClient> {
         InductionEngine::new(
             store,
             Arc::new(InMemoryRecurrenceTracker::new()),
@@ -921,12 +687,9 @@ mod tests {
     #[tokio::test]
     async fn mode_b_opted_in_within_age_serves_believed_unverified() {
         // Requirement 21: exercise the Mode B path through start_goal so the
-        // integration helper covers the believed-unverified branch too.
-        let provider = FakeProvider::new();
-        let cache = InMemoryTier1Cache::new();
-        let resolver = MapResolver::new();
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
+        // integration helper covers the believed-unverified branch too. Mode B
+        // serving depends only on opt-in + age, not token freshness, so the
+        // stale validator still serves believed-unverified here.
         let outcome = CachedOutcome {
             answer: OutcomeValue(CanonicalJson("\"volatile\"".to_owned())),
             mode: AnswerMode::BoundedVolatile {
@@ -946,7 +709,7 @@ mod tests {
         let retrieval = MemoryRetrieval::new(&store, &embedder);
         let policy = AllowListModeB::new(vec![IntentType::from("lookup")]);
 
-        let start = start_goal(&sig(), &retrieval, &validator, &policy, Timestamp(50));
+        let start = start_goal(&sig(), &retrieval, &StaleValidator, &policy, Timestamp(50)).await;
         match start {
             GoalStart::Replay(ReplayDecision::ServeAnswer { verified, .. }) => {
                 assert!(!verified, "Mode B is always believed-unverified");
@@ -957,17 +720,12 @@ mod tests {
 
     // --- Task 9.3: empty-candidate resilience (Requirements 14.2, 15.1) ---
 
-    #[test]
-    fn start_goal_with_summaries_empty_candidates_yields_empty_and_from_scratch() {
+    #[tokio::test]
+    async fn start_goal_with_summaries_empty_candidates_yields_empty_and_from_scratch() {
         // Requirement 14.2: when retrieval returns no candidates, `summaries` is
         // empty and `start` is the from-scratch replay decision. An empty store
         // yields no structured head and (with an available embedder) an empty
         // ann_recall, so retrieval returns no candidates.
-        let provider = FakeProvider::new();
-        let cache = InMemoryTier1Cache::new();
-        let resolver = MapResolver::new();
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
         let store = InMemoryMemoryStore::new();
         let embedder = FixedEmbedder;
         let retrieval = MemoryRetrieval::new(&store, &embedder);
@@ -980,11 +738,12 @@ mod tests {
         let with = start_goal_with_summaries(
             &sig(),
             &retrieval,
-            &validator,
+            &StaleValidator,
             &DenyAllModeB,
             Timestamp(0),
             &summary_provider,
-        );
+        )
+        .await;
         assert_eq!(
             with.start,
             GoalStart::FromScratch,
@@ -996,18 +755,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn start_goal_with_summaries_disabled_matches_start_goal() {
+    #[tokio::test]
+    async fn start_goal_with_summaries_disabled_matches_start_goal() {
         // Requirement 15.1: a disabled provider yields the same `start` as
         // `start_goal` and produces no freshly retrieved summaries. Use a
         // non-empty store so `start_goal` returns a real replay decision.
-        let provider = FakeProvider::new().with_content("file://a", b"v1");
-        let cache = InMemoryTier1Cache::new();
-        let source = pinnable("file://a");
-        let token = cache.issue_token(&source, &provider).expect("issue");
-        let resolver = MapResolver::new().with(&token, source.clone());
-        let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
-
+        let token = content_token("a");
         let store = InMemoryMemoryStore::new();
         store
             .insert(
@@ -1018,17 +771,19 @@ mod tests {
         let embedder = FixedEmbedder;
         let retrieval = MemoryRetrieval::new(&store, &embedder);
 
-        let plain = start_goal(&sig(), &retrieval, &validator, &DenyAllModeB, Timestamp(0));
+        let plain =
+            start_goal(&sig(), &retrieval, &StaleValidator, &DenyAllModeB, Timestamp(0)).await;
 
         let summary_provider = SummaryProvider::new(SummaryConfig::default());
         let with = start_goal_with_summaries(
             &sig(),
             &retrieval,
-            &validator,
+            &StaleValidator,
             &DenyAllModeB,
             Timestamp(0),
             &summary_provider,
-        );
+        )
+        .await;
 
         assert_eq!(
             with.start, plain,
@@ -1066,13 +821,7 @@ mod tests {
         fn summaries_are_additive_and_never_alter_replay(
             (count, enabled, max_summaries) in arb_summary_scenario()
         ) {
-            // Deterministic validator/provider so both calls see identical inputs.
-            let provider = FakeProvider::new().with_content("file://a", b"v1");
-            let cache = InMemoryTier1Cache::new();
-            let source = pinnable("file://a");
-            let token = cache.issue_token(&source, &provider).expect("issue");
-            let resolver = MapResolver::new().with(&token, source.clone());
-            let validator = Tier1EvidenceValidator::new(&cache, &provider, &resolver);
+            let token = content_token("a");
 
             // Build a store with `count` applicable memories (some with cached
             // sound outcomes, some without) so the top candidate varies across
@@ -1121,16 +870,22 @@ mod tests {
 
             // The plain replay decision and the additive one must agree on
             // `start`, regardless of enablement or produced summaries.
-            let plain =
-                start_goal(&sig(), &retrieval, &validator, &DenyAllModeB, Timestamp(0));
-            let with = start_goal_with_summaries(
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let plain = rt.block_on(start_goal(
                 &sig(),
                 &retrieval,
-                &validator,
+                &StaleValidator,
+                &DenyAllModeB,
+                Timestamp(0),
+            ));
+            let with = rt.block_on(start_goal_with_summaries(
+                &sig(),
+                &retrieval,
+                &StaleValidator,
                 &DenyAllModeB,
                 Timestamp(0),
                 &summary_provider,
-            );
+            ));
 
             prop_assert_eq!(with.start, plain);
         }

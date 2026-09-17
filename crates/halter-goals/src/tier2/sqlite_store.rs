@@ -207,11 +207,15 @@ fn kind_tag(kind: MemoryKind) -> &'static str {
 /// Runs a single `INSERT OR REPLACE` keyed by [`MemoryId`], deriving the indexed
 /// columns from `mem.intent`/`mem.kind`, serializing the body to JSON for
 /// lossless round-trip, and — mirroring `InMemoryMemoryStore::record_from` —
-/// storing `Embedding::default()` in the `embedding` column so ANN ranking has
-/// parity with the reference store (the body carries no embedding).
+/// storing the caller-supplied `embedding` in the `embedding` column so ANN
+/// ranking has parity with the reference store (the body carries no embedding).
 ///
-/// This works on any `&Connection`, so both the plain `insert` path (holding
-/// the mutex guard) and the transactional `reinforce` path share it.
+/// The `embedding` is produced by the write path async, up front, outside the
+/// store mutex, and passed in here; a backend-unavailable write passes an empty
+/// [`Embedding`] and still succeeds (Req 6.4).
+///
+/// This works on any `&Connection`, so both the plain insert path (holding the
+/// mutex guard) and the transactional `reinforce` path share it.
 ///
 /// The `MemoryStore` trait exposes only `MemoryStoreError` (a validation error)
 /// on writes, and validation has already run before this is called; the
@@ -227,10 +231,11 @@ fn upsert_record(
     subtree_hash: &SubtreeHash,
     created_at: Timestamp,
     updated_at: Timestamp,
+    embedding: &Embedding,
 ) {
     let body = serde_json::to_string(mem).expect("Memory must serialize to JSON");
     let embedding_blob =
-        serde_json::to_vec(&Embedding::default()).expect("Embedding must serialize to JSON");
+        serde_json::to_vec(embedding).expect("Embedding must serialize to JSON");
 
     conn.execute(
         "INSERT OR REPLACE INTO memories (
@@ -256,13 +261,14 @@ fn upsert_record(
 }
 
 impl MemoryStore for SqliteMemoryStore {
-    fn insert(
+    fn insert_with_embedding(
         &self,
         key: (GoalNodeId, SubtreeHash),
         mem: Memory,
+        embedding: Embedding,
     ) -> Result<MemoryId, MemoryStoreError> {
         // Validate before any SQL so a rejected write leaves the DB unchanged
-        // (Requirements 2.1, 2.3), mirroring `InMemoryMemoryStore::insert`.
+        // (Requirements 2.1, 2.3), mirroring `InMemoryMemoryStore`.
         validate_memory(&mem)?;
 
         let (node_id, subtree_hash) = key;
@@ -276,7 +282,7 @@ impl MemoryStore for SqliteMemoryStore {
             .conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_record(&guard, &mem, &node_id, &subtree_hash, now, now);
+        upsert_record(&guard, &mem, &node_id, &subtree_hash, now, now, &embedding);
 
         Ok(id)
     }
@@ -348,7 +354,18 @@ impl MemoryStore for SqliteMemoryStore {
                 let subtree_hash = candidate.version.0.clone();
                 let new_id = candidate.id.clone();
                 let now = Timestamp::default();
-                upsert_record(&tx, &candidate, &node_id, &subtree_hash, now, now);
+                // Reinforce of an absent id is a first observation; it carries
+                // no write-time embedding, so store an empty one (matching the
+                // pre-embedding behavior and the in-memory reference).
+                upsert_record(
+                    &tx,
+                    &candidate,
+                    &node_id,
+                    &subtree_hash,
+                    now,
+                    now,
+                    &Embedding::default(),
+                );
                 new_id
             }
         };

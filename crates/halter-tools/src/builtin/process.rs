@@ -317,6 +317,7 @@ impl Tool for ProcessTool {
                 requires_approval: true,
                 cancellable: false,
                 long_running: false,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -365,7 +366,7 @@ impl Tool for ProcessTool {
             _ => anyhow::bail!("failed to execute process tool: unknown action '{action}'"),
         };
 
-        Ok(ToolResult::Json { value })
+        Ok(ToolResult::json(value))
     }
 }
 

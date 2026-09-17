@@ -2920,9 +2920,7 @@ mod tests {
                 Message::Tool(ToolResultMessage {
                     id: MessageId::from("tool_output_1"),
                     call_id: ToolCallId::from("call_123"),
-                    content: ToolResult::Json {
-                        value: json!({"ok": true}),
-                    },
+                    content: ToolResult::json(json!({"ok": true})),
                     error: None,
                     created_at: Utc::now(),
                 }),

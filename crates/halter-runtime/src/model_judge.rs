@@ -323,6 +323,7 @@ fn panel_services(
         trace_recorder: parent.trace_recorder.clone(),
         goal_tracking: parent.goal_tracking,
         goal_store: parent.goal_store.clone(),
+        tier2: parent.tier2.clone(),
     })
 }
 

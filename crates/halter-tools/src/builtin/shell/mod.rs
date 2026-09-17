@@ -48,6 +48,7 @@ impl Tool for ShellTool {
                 requires_approval: true,
                 cancellable: true,
                 long_running: true,
+                ..Default::default()
             },
             provider_aliases: Default::default(),
         }
@@ -80,15 +81,13 @@ impl Tool for ShellTool {
         )
         .await?;
 
-        Ok(ToolResult::Json {
-            value: json!({
-                "exit_code": result.exit_code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "timed_out": result.timed_out,
-                "cancelled": result.cancelled,
-            }),
-        })
+        Ok(ToolResult::json(json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "timed_out": result.timed_out,
+            "cancelled": result.cancelled,
+        })))
     }
 }
 
@@ -96,7 +95,7 @@ impl Tool for ShellTool {
 mod tests {
     use std::sync::Arc;
 
-    use halter_protocol::ToolResult;
+    use halter_protocol::{ToolResult, ToolResultKind};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
@@ -127,8 +126,8 @@ mod tests {
     }
 
     fn json_value(result: ToolResult) -> Value {
-        match result {
-            ToolResult::Json { value } => value,
+        match result.kind {
+            ToolResultKind::Json { value } => value,
             other => panic!("expected json result, got {other:?}"),
         }
     }

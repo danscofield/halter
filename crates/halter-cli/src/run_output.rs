@@ -166,9 +166,7 @@ mod tests {
                     message: Message::Tool(halter_protocol::ToolResultMessage {
                         id: MessageId::from("tool-message"),
                         call_id: halter_protocol::ToolCallId::from("call-1"),
-                        content: halter_protocol::ToolResult::Text {
-                            text: "ok".to_owned(),
-                        },
+                        content: halter_protocol::ToolResult::text("ok"),
                         error: None,
                         created_at: Utc::now(),
                     }),
